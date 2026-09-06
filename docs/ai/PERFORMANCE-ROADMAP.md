@@ -31,7 +31,7 @@ Server: 12 vCPU, 31 GB RAM. Node v20, PM2, Mongo localhost, Traccar memory gatew
 | Phase | Name | Status |
 |-------|------|--------|
 | **P0-A** | Raw writer drain deadlock | **COMPLETE + PRODUCTION VERIFIED** (2026-09-06) |
-| **P0-B** | Separate raw failure domain from realtime + exact retry dedupe | **THIS SLICE** (code+tests; deploy manually) |
+| **P0-B** | Separate raw failure domain from realtime + exact retry dedupe | **HARDENED** (pre-deploy); await manual verify |
 | **P0-B2** | Dedicated Raw Archive Worker (process isolation) | Documented next isolation step |
 | **P0-C** | Analyze remaining live OOO/stale after exact-retry suppression; RT latency metrics | After P0-B prod verify |
 | **P0-D** | Degradation survival (listeners alive when raw/Mongo sick) | After P0-C |
@@ -75,13 +75,16 @@ Raw enqueue reject → HTTP 503 **before** normalize/forward/WS.
 ### Defaults
 
 - `FORWARD_RETRY_DEDUPE_TTL_MS=120000`
-- `FORWARD_RETRY_DEDUPE_MAX=50000`
+- `FORWARD_RETRY_DEDUPE_MAX=100000` (~50 MB @ ~500 B/entry)
+- Future 1–2k pkt/s: raise MAX to **250000** (~125 MB) **or** shorten TTL to 60s — watch `forward_retry_cache_evicted_capacity_total`
+- Do not remove `serverTime` from fingerprint without evidence (Traccar retries reuse same Position object)
 
 ### Expected post-deploy
 
 - Raw queue full / durable fail does **not** freeze listeners on first packet
 - `raw_failure_realtime_continued_total` may increment under raw pressure
 - `forward_exact_retry_total` rises when Traccar retries after 503
+- Watch `raw_durable_accept_latency_p99_ms` and retry-cache eviction counters
 - Live eligibility may improve further vs post-P0-A (still do **not** loosen freshness in P0-B)
 
 ---

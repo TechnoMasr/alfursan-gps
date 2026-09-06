@@ -98,7 +98,40 @@ Ingredients (stable on Traccar retry of the same Position):
 
 - Does **not** use `position.id`
 - Legitimate stationary samples with new timestamps are **not** suppressed
-- Defaults: `FORWARD_RETRY_DEDUPE_TTL_MS=120000`, `FORWARD_RETRY_DEDUPE_MAX=50000` (~10MB order)
+- Defaults: `FORWARD_RETRY_DEDUPE_TTL_MS=120000`, `FORWARD_RETRY_DEDUPE_MAX=100000` (~50MB order)
+
+### Fingerprint / `serverTime` stability (Traccar 6.13.2)
+
+Source: `PositionForwardingHandler` keeps the **same** `PositionData` (same `Position` object) across HTTP forward retries (`AsyncRequestAndCallback` resends `this.positionData`). Therefore retries of the **same** forward attempt preserve:
+
+- `fixTime`, `deviceTime`, `serverTime` (set once when the Position is created/enriched)
+- coordinates, protocol, attributes snapshot on that Position
+
+`serverTime` is **not** rewritten on each HTTP delivery attempt for the same Position. It remains in the fingerprint.
+
+**Caveat (not observed as retry mutation):** the `Device` object is read from `CacheManager` at first forward construction; if a live mutable Device were mutated between retries, device-side fields in the JSON could change — our fingerprint uses Position fields + IMEI/`uniqueId`, not mutable device status. **Do not remove `serverTime` without production evidence** of retry fingerprint mismatch.
+
+Production verification: set `BRIDGE_DEBUG_IMEI=<imei>` to log `forward_retry_fingerprint` / `forward_retry_state` on the forward path.
+
+### Retry cache memory & cleanup
+
+| Entries | ≈ memory @ 500 B/entry |
+|---------|-------------------------|
+| 50k | ~25 MB |
+| 100k | ~50 MB (current default) |
+| 250k | ~125 MB (for ~2k pkt/s × 120s) |
+
+Cleanup: expire walk is O(expired prefix), capped at 64 deletes/call — no full-map scan. Capacity eviction prefers non-`processing` entries. Metrics: `forward_retry_cache_size`, `forward_retry_cache_expired_total`, `forward_retry_cache_evicted_capacity_total`.
+
+### Processing states
+
+- `processing` — fingerprint claimed; concurrent identical HTTP attempts **suppress**
+- `processed` — only after forward queue **accepted** (`commit`)
+- `abandon` — forward queue rejected → entry removed → Traccar retry may dispatch downstream again
+
+### Raw durable latency
+
+HTTP awaits local journal only. Metrics: `raw_durable_accept_latency_ms` (last) + p50/p95/p99 from a 128-sample ring.
 
 ---
 

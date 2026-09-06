@@ -921,9 +921,15 @@ function startSubscribersServer() {
       forward_retry_suppressed_live_total: bridgeMetrics.forward_retry_suppressed_live_total || 0,
       forward_retry_suppressed_persistence_total: bridgeMetrics.forward_retry_suppressed_persistence_total || 0,
       forward_retry_cache_size: forwardRetryDedupe.getSize(),
+      forward_retry_cache_evicted_capacity_total: bridgeMetrics.forward_retry_cache_evicted_capacity_total || 0,
+      forward_retry_cache_expired_total: bridgeMetrics.forward_retry_cache_expired_total || 0,
       raw_durable_accept_success_total: bridgeMetrics.raw_durable_accept_success_total || 0,
       raw_durable_accept_failure_total: bridgeMetrics.raw_durable_accept_failure_total || 0,
       raw_failure_realtime_continued_total: bridgeMetrics.raw_failure_realtime_continued_total || 0,
+      raw_durable_accept_latency_ms: bridgeMetrics.raw_durable_accept_latency_ms || 0,
+      raw_durable_accept_latency_p50_ms: bridgeMetrics.raw_durable_accept_latency_p50_ms || 0,
+      raw_durable_accept_latency_p95_ms: bridgeMetrics.raw_durable_accept_latency_p95_ms || 0,
+      raw_durable_accept_latency_p99_ms: bridgeMetrics.raw_durable_accept_latency_p99_ms || 0,
       raw_ingress_received_total: bridgeMetrics.raw_ingress_received_total || 0,
       raw_ingress_accepted_total: bridgeMetrics.raw_ingress_accepted_total || 0,
       raw_ingress_persisted_total: bridgeMetrics.raw_ingress_persisted_total || 0,
@@ -1024,6 +1030,7 @@ function startSubscribersServer() {
         forwardQueue,
         retryDedupe: forwardRetryDedupe,
         bumpForwardPositionsReceived,
+        imeiDebugger,
       });
       return res.status(result.status).json(result.body);
     } catch (err) {
