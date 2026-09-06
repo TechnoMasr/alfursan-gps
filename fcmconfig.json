@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "alfursan-trucking",
+  "private_key_id": "f824bb821d701eea8dde15c622035cdfed01835b",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDFps40Hzcfqfqv\nMqvFtUWsS0tHBzmvAIsKDZGpc7wTDpTWsTlg4lTxV3JjaRvVAj3ytJYDrPJCTa3l\nsbh4/WLHD1f5KHtxnstY82iUbQKWjfyN6VkhpSSGuFvqMYaCknNLoVnlhTjlrOJ1\nu6DR3Sgn1FxVT6Z3//y9hvzmda1OgW35c4K88nrfxNffMNeWRZMZpEownRA3PhYl\nONBfVFb46A8ClBnLNArcecqdyTm28h7ICitQhjg5TfXiypD5Ho0OcuYBPJjG2Ig4\nW2ZcLd+EBOL4jUdeGUpD7EujCoA6Hc/Y1Qvu8jTXAk+C00XbGlMCxYU6jP0E2jvy\noAnU3i5tAgMBAAECggEAFf2CiKsGa4fyY6asFNGfwFUaOXtU0CMr1QEAeU1umeIv\n7hkGrMBRug5EJEpP9emLceLko+EMjRLua5VT1GZApKwQ2iBGZ7RGpI1kT8s3FAAV\nHsbdC1C/2RtO4qYC9KkNmdcIVPB3DZqoEXhAIslLy+6lHTrA5y38dSu9HHjwQMEU\nSOLfNaC2XshIrS5ycGfKbxbEqJPKNgcbkK1fFd7Lh9j+vMDVt7QZm245o/Kqy6Va\n45KKttsHXWVyezH9EfmGoOikzNWIF26Wzq5LxiSWuNaagtmV8pkWiod1W+FVf7M+\n9Ph6RGNa/E2otfh0fUW7df89U2wMCVi5DumBtkSG4QKBgQD+Ord8m8lDmLFmvDbZ\nQKEJpuMI/Vth4Agh3PYQGPXF2BnaSIaqEykjbAUsn4FT3jbsCeLYM3Qa2GpCTK1V\n2NRuO2Je+hARlK13f70Flmt+qYDoM+cV+e6WJphnJTOTp2SFAGRvoE4svuFuRs7V\n1nqQRFiEn+cp7GJaS7t3aYbm8QKBgQDHBzZXdd13r5vTZDSWOQ49Q+B1TtY3+c8C\nocq4b9909yW2jXGIxKK9vu5NwyVXd5QMz0WYr7bOGqjlyaxhTxHEKCR/UoHLOL6x\nG96GQP99rlGn0urxtsclZA44z/idpWS1V5c9dsQ2u0JSLT9+MbtZNu6CbtFzDsBe\nO5ipP5GXPQKBgQCPhoimUbELd33X2TRB7Km9sDkGjzpzBC6zJ3LHXcALJNhbkoxs\nIgsck1RMf/Rca9yn32Dw3AOVUE6VBYLqL1KmtOHxas19j2lrSHNnXydqx7kd3od8\nsbBPlpR9ztPSbTNjnvgUyPS5cD4GqvUEZmSlY+BxZ3DzCx/viEfav3nIkQKBgFk3\nsHJwUYDPZajTKIeWt/1aqgmr93dMMjHZ2QfojmDeUTeOHDDVBKbOKgEN03VsEx/S\n4j3ZtraZWND5IJ7WVP57iDDTCX/RxhmahpvkEyOBuvTiJZOI/aiTO5TYFXiFpals\nxE03Kinms4om4mltXbBWYYBysM1E9ZLIYFyuNFN5AoGBAN3QgILPwkier9pSTHRB\nJ6Ko0FiK4mW/SFvGu/9B81uqQNokQ3MI/gawq9bXbKWqamb7Bk8IZNP0LmSxnmRv\naIBK3yHVl+AcDX+SkW5GrAbpyFs1NPigePA8zbhsi1hMnuXLgqv17k0o7rGB/axS\nbvI1KE0gd2i8ZFEOz7S+3Iqv\n-----END PRIVATE KEY-----\n",
+  "client_email": "firebase-adminsdk-fbsvc@alfursan-trucking.iam.gserviceaccount.com",
+  "client_id": "103782112584513290810",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-fbsvc%40alfursan-trucking.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
