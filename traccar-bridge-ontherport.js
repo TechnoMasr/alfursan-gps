@@ -31,6 +31,8 @@ const {
   createTraccarRawIngressWriter,
   buildTraccarRawIngressDoc,
 } = require("./lib/traccarRawIngressWriter");
+const { createForwardRetryDedupe } = require("./lib/forwardRetryDedupe");
+const { handleTraccarForwardPosition } = require("./lib/handleTraccarForwardPosition");
 const { resolveRuntimeDeviceIdByImei: resolveRuntimeDeviceIdByImeiViaTraccar } = require("./lib/traccarRuntimeDevices");
 const { maybeLatencyLog } = require("./lib/latencyLog");
 const { createEventLoopLagMonitor } = require("./lib/eventLoopLag");
@@ -117,6 +119,11 @@ const rawIngressWriter = createTraccarRawIngressWriter({
   maxQueueDepth: Math.max(1000, BRIDGE_ENV.TRACCAR_FORWARD_QUEUE_MAX || 5000),
   metrics: bridgeMetrics,
   log: console,
+});
+const forwardRetryDedupe = createForwardRetryDedupe({
+  ttlMs: BRIDGE_ENV.FORWARD_RETRY_DEDUPE_TTL_MS,
+  maxEntries: BRIDGE_ENV.FORWARD_RETRY_DEDUPE_MAX,
+  metrics: bridgeMetrics,
 });
 /** Per-IMEI broadcast ordering guard (tenant room + subscribers). */
 const lastBroadcastPacketMsByImei = new Map();
@@ -910,6 +917,13 @@ function startSubscribersServer() {
       traccar_forward_queue_depth: forwardQueue.getDepth(),
       traccar_forward_queue_rejected_total: bridgeMetrics.forward_queue_rejected_total || 0,
       traccar_command_responses_total: bridgeMetrics.forward_command_responses_total || 0,
+      forward_exact_retry_total: bridgeMetrics.forward_exact_retry_total || 0,
+      forward_retry_suppressed_live_total: bridgeMetrics.forward_retry_suppressed_live_total || 0,
+      forward_retry_suppressed_persistence_total: bridgeMetrics.forward_retry_suppressed_persistence_total || 0,
+      forward_retry_cache_size: forwardRetryDedupe.getSize(),
+      raw_durable_accept_success_total: bridgeMetrics.raw_durable_accept_success_total || 0,
+      raw_durable_accept_failure_total: bridgeMetrics.raw_durable_accept_failure_total || 0,
+      raw_failure_realtime_continued_total: bridgeMetrics.raw_failure_realtime_continued_total || 0,
       raw_ingress_received_total: bridgeMetrics.raw_ingress_received_total || 0,
       raw_ingress_accepted_total: bridgeMetrics.raw_ingress_accepted_total || 0,
       raw_ingress_persisted_total: bridgeMetrics.raw_ingress_persisted_total || 0,
@@ -992,54 +1006,30 @@ function startSubscribersServer() {
     });
   });
 
-  app.post("/traccar/position", (req, res) => {
+  app.post("/traccar/position", async (req, res) => {
     if (!isJsonContentType(req)) {
       bridgeMetrics.forward_invalid_total = (bridgeMetrics.forward_invalid_total || 0) + 1;
       return res.status(415).json({ ok: false, error: "json_required" });
     }
 
     const receivedAt = Date.now();
-    bridgeMetrics.raw_ingress_received_total = (bridgeMetrics.raw_ingress_received_total || 0) + 1;
-    bridgeMetrics.raw_ingress_last_received_at = new Date(receivedAt).toISOString();
-    const rawQueued = rawIngressWriter.enqueue(buildTraccarRawIngressDoc(req.body, receivedAt));
-    if (!rawQueued.accepted) {
-      return res.status(503).json({ ok: false, error: rawQueued.reason });
-    }
-
-    const normalized = normalizeForwardPayload(req.body);
-    if (!normalized.ok) {
-      bridgeMetrics.forward_invalid_total =
-        (bridgeMetrics.forward_invalid_total || 0) + Math.max(1, normalized.invalid.length);
-      return res.status(202).json({
-        ok: true,
-        ingress: "http-forward",
-        raw_accepted: true,
-        accepted: 0,
-        error: "invalid_forward_position",
-        invalid: normalized.invalid.slice(0, 5),
+    try {
+      const result = await handleTraccarForwardPosition({
+        body: req.body,
+        receivedAt,
+        metrics: bridgeMetrics,
+        rawIngressWriter,
+        buildRawDoc: buildTraccarRawIngressDoc,
+        normalizeForwardPayload,
+        forwardQueue,
+        retryDedupe: forwardRetryDedupe,
+        bumpForwardPositionsReceived,
       });
+      return res.status(result.status).json(result.body);
+    } catch (err) {
+      console.error("[forward] handler failure", err?.message || err);
+      return res.status(500).json({ ok: false, error: "forward_handler_failure" });
     }
-
-    bridgeMetrics.forward_last_received_at = new Date(receivedAt).toISOString();
-    bumpForwardPositionsReceived(normalized.items.length);
-    bridgeMetrics.forward_invalid_total =
-      (bridgeMetrics.forward_invalid_total || 0) + normalized.invalid.length;
-    const commandCount = normalized.items.filter((item) => item.hasCommandResponse).length;
-    bridgeMetrics.forward_command_responses_total =
-      (bridgeMetrics.forward_command_responses_total || 0) + commandCount;
-
-    const queued = forwardQueue.enqueue({ normalized, receivedAt });
-    if (!queued.accepted) {
-      return res.status(503).json({ ok: false, error: queued.reason });
-    }
-
-    return res.status(202).json({
-      ok: true,
-      ingress: "http-forward",
-      accepted: normalized.items.length,
-      invalid: normalized.invalid.length,
-      queue_depth: queued.depth,
-    });
   });
 
   /**
