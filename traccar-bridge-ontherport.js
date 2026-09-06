@@ -973,6 +973,7 @@ function startSubscribersServer() {
       traccar_model_sync_pending: bridgeMetrics.traccar_model_sync_pending || 0,
       traccar_model_sync_queue_depth: bridgeMetrics.traccar_model_sync_queue_depth || 0,
       traccar_model_cache_size: bridgeMetrics.traccar_model_cache_size || 0,
+      traccar_model_no_model_cache_size: bridgeMetrics.traccar_model_no_model_cache_size || 0,
       traccar_model_sync_last_success_at: bridgeMetrics.traccar_model_sync_last_success_at || null,
       traccar_power_seen_total: bridgeMetrics.traccar_power_seen_total || 0,
       persistence_health: persistenceHealth,

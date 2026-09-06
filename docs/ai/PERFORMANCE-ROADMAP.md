@@ -2,7 +2,7 @@
 
 **Source of truth for AI agents.** Update after every completed phase. CURRENT HEAD > old audit reports.
 
-Last updated: 2026-09-06 — **P0-B implemented (awaiting manual deploy/verify)**
+Last updated: 2026-09-06 — **Model-sync lifecycle fix** (in addition to P0-B hardened)
 
 ---
 
@@ -102,9 +102,11 @@ Next: another production sample to see if spool age/depth fall or grow, then inv
 
 ---
 
-## FUNCTIONAL — power
+## FUNCTIONAL — power / model sync
 
-`traccar_power_seen_total` observed (e.g. 6). Model sync exists. Full E2E verification later — do not calculate voltage in Node.
+`traccar_power_seen_total` observed (e.g. 6). Full SEEWORLD E2E later — do not calculate voltage in Node.
+
+**Model sync (2026-09-06):** lifecycle-based, not packet-based. Negative cache default **10 min**. No per-packet `skipped: no tr_model` flood. Traccar restart (`model=null`) still forces one re-sync. See ARCHITECTURE.md.
 
 ---
 

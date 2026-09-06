@@ -192,6 +192,29 @@ Parent batches `PERSISTENCE_IPC_BATCH_MAX_ITEMS=100` / `WAIT_MS=5`. ACK ≠ Mong
 
 ---
 
+## Traccar model sync (lifecycle, not packet)
+
+**Invariant:** Traccar `device.model` synchronization is **device-lifecycle triggered**, never per-packet.
+
+Hot path after resolution: **Map lookup only** — no Mongo, no Traccar HTTP, no log spam.
+
+| Case | Behavior |
+|------|----------|
+| First see IMEI | Resolve `device_details.tr_model` (fallback `devicestatuses`) **once** |
+| `tr_model` missing | `no_model` negative cache (default **10 min**); log **once**; later packets silent |
+| Negative TTL expiry | One re-lookup; if still missing, stay quiet (no repeated `skipped: no tr_model`) |
+| Synced + matching model | Silent |
+| Forwarded `model=null` after Traccar restart | Invalidate runtime sync; re-PUT using **cached desired model** (no Mongo if positive cache warm) |
+| Runtime device id changes | New runtime lifecycle; re-sync once with cached desired model |
+| `MODEL_A`→`MODEL_B` | Positive metadata TTL refresh, then one sync |
+
+Defaults: `TRACCAR_MODEL_NEGATIVE_CACHE_TTL_MS=600000`, `TRACCAR_MODEL_CACHE_TTL_MS=300000`.  
+Debug: `TRACCAR_MODEL_SYNC_DEBUG_IMEI`. Invalidate: `traccarModelSync.invalidate(imei)`.
+
+Metrics: `requested` / `skipped_no_model` count **resolution/sync work**, not every GPS packet.
+
+---
+
 ## Related docs
 
 - [`PERFORMANCE-ROADMAP.md`](./PERFORMANCE-ROADMAP.md)
