@@ -278,6 +278,33 @@ const staticStatSchema = new mongoose.Schema(
 );
 staticStatSchema.index({ imei: 1, day: 1 }, { unique: true });
 
+// Tracker connectivity outage intervals. These are based on connection state,
+// not GPS freshness, motion, speed, or ignition.
+const deviceDisconnectionSchema = new mongoose.Schema(
+  {
+    imei: { type: String, index: true, required: true },
+    start_at: { type: Date, required: true, index: true },
+    end_at: { type: Date, default: null, index: true },
+    duration_sec: { type: Number, default: 0 },
+    is_open: { type: Boolean, default: true, index: true },
+    reason: String,
+    opened_by: String,
+    closed_by: String,
+    close_reason: String,
+    last_seen_offline_at: Date,
+  },
+  { timestamps: true, strict: false }
+);
+deviceDisconnectionSchema.index({ imei: 1, start_at: -1 });
+deviceDisconnectionSchema.index(
+  { imei: 1, is_open: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { is_open: true },
+  }
+);
+deviceDisconnectionSchema.set("collection", "device_disconnections");
+
 // 🔹 Collection: command_response (تخزين الأوامر والردود)
 const commandResponseSchema = new mongoose.Schema(
   {
@@ -394,6 +421,7 @@ const TravelStat = mongoose.model('TravelStat', travelStatSchema);
 const IdleStat = mongoose.model('IdleStat', idleStatSchema);
 const StaticStat = mongoose.model('StaticStat', staticStatSchema);
 const ParkingEvent = mongoose.model('ParkingEvent', parkingEventSchema);
+const DeviceDisconnection = mongoose.model("DeviceDisconnection", deviceDisconnectionSchema);
 const CommandResponse = mongoose.model('command_response', commandResponseSchema);
 const Notification = mongoose.model('Notification', notificationSchema);
 
@@ -410,6 +438,7 @@ module.exports = {
   IdleStat,
   StaticStat,
   ParkingEvent,
+  DeviceDisconnection,
   CommandResponse,
   Notification,
 };

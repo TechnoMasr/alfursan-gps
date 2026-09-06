@@ -2,6 +2,13 @@
  * Atomic DeviceStatus GPS updates — never regress last_fix / coords from older packets.
  */
 
+const {
+  isOnlineDeviceStatus,
+  isOfflineDeviceStatus,
+  markDeviceOffline,
+  markDeviceOnline,
+} = require("./deviceConnectivityService");
+
 function newerFixCondition(fixAt) {
   return {
     $or: [
@@ -101,6 +108,16 @@ function buildGpsStatusUpdatePipeline({
   if (update.status_code !== undefined) $set.status_code = update.status_code;
   if (update.status !== undefined) $set.status = update.status;
   if (update.traccar_device_status !== undefined) $set.traccar_device_status = update.traccar_device_status;
+  if (update.connected !== undefined) $set.connected = update.connected;
+  if (update.is_connected !== undefined) $set.is_connected = update.is_connected;
+  if (update.connection_state !== undefined) $set.connection_state = update.connection_state;
+  if (update.connected_at !== undefined) $set.connected_at = update.connected_at;
+  if (update.last_connect_at !== undefined) $set.last_connect_at = update.last_connect_at;
+  if (update.connect_source !== undefined) $set.connect_source = update.connect_source;
+  if (update.disconnected_at !== undefined) $set.disconnected_at = update.disconnected_at;
+  if (update.last_disconnect_at !== undefined) $set.last_disconnect_at = update.last_disconnect_at;
+  if (update.disconnect_reason !== undefined) $set.disconnect_reason = update.disconnect_reason;
+  if (update.disconnect_source !== undefined) $set.disconnect_source = update.disconnect_source;
   if (update.io !== undefined) $set.io = update.io;
   if (update.hours !== undefined) $set.hours = update.hours;
   if (update.device_total_distance !== undefined) $set.device_total_distance = update.device_total_distance;
@@ -189,8 +206,27 @@ async function upsertDeviceStatus(params) {
   update.pdop = pdop ?? null;
   update.hdop = hdop ?? null;
   update.status_code = status ?? null;
-  update.status = deviceStatus ?? null;
-  update.traccar_device_status = deviceStatus ?? null;
+  const normalizedDeviceStatus = String(deviceStatus ?? "").trim().toLowerCase();
+  if (normalizedDeviceStatus) {
+    update.status = normalizedDeviceStatus;
+    update.traccar_device_status = normalizedDeviceStatus;
+    if (isOnlineDeviceStatus(normalizedDeviceStatus)) {
+      update.connected = true;
+      update.is_connected = true;
+      update.connection_state = "online";
+      update.connected_at = ingressAt || new Date();
+      update.last_connect_at = ingressAt || new Date();
+      update.connect_source = "traccar_forward";
+    } else if (isOfflineDeviceStatus(normalizedDeviceStatus)) {
+      update.connected = false;
+      update.is_connected = false;
+      update.connection_state = "offline";
+      update.disconnected_at = ingressAt || new Date();
+      update.last_disconnect_at = ingressAt || new Date();
+      update.disconnect_reason = "traccar_status_offline";
+      update.disconnect_source = "traccar_forward";
+    }
+  }
   update.io = Object.fromEntries(Object.entries(params.attrs || {}).filter(([k]) => /^io\d+$/i.test(k)));
   update.hours = hours ?? null;
   update.device_total_distance = Number.isFinite(totalDistanceM) ? totalDistanceM : null;
@@ -207,7 +243,16 @@ async function upsertDeviceStatus(params) {
   if (Number.isFinite(batteryVoltage)) update.battery_voltage = batteryVoltage;
   if (Number.isFinite(batteryLevel)) update.battery_level = batteryLevel;
 
-  return DeviceStatus.findOneAndUpdate(
+  if (isOfflineDeviceStatus(normalizedDeviceStatus)) {
+    await markDeviceOffline({
+      imei,
+      at: ingressAt || new Date(),
+      reason: "traccar_status_offline",
+      source: "traccar_forward",
+    });
+  }
+
+  const statusDoc = await DeviceStatus.findOneAndUpdate(
     { imei },
     buildGpsStatusUpdatePipeline({
       update,
@@ -224,6 +269,18 @@ async function upsertDeviceStatus(params) {
     }),
     { upsert: true, new: true }
   );
+
+  if (isOnlineDeviceStatus(normalizedDeviceStatus)) {
+    await markDeviceOnline({
+      imei,
+      at: ingressAt || new Date(),
+      status: normalizedDeviceStatus,
+      source: "traccar_forward",
+      skipRecentNoOpen: true,
+    });
+  }
+
+  return statusDoc;
 }
 
 module.exports = {

@@ -270,6 +270,7 @@ async function applyTripLogic({ imei, doc, packetDate }) {
 function deviceStatusTransitionKey({ doc, attrs } = {}) {
   return JSON.stringify({
     type: doc?.type || null,
+    deviceStatus: doc?.deviceStatus || null,
     attrsType: attrs?.type ?? null,
     ignition: attrs?.ignition ?? null,
     motion: attrs?.motion ?? null,

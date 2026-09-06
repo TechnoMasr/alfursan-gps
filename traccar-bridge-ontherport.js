@@ -37,6 +37,7 @@ const { createEventLoopLagMonitor } = require("./lib/eventLoopLag");
 const { createImeiDebugger } = require("./lib/imeiDebug");
 const { countSubscriberMetrics } = require("./lib/subscriberCounts");
 const { createTenantRoomGpsThrottle } = require("./lib/tenantRoomGpsThrottle");
+const { runStartupConnectivityReconciliation } = require("./lib/startupConnectivityReconciliation");
 const {
   verifyForwardBearer,
   isJsonContentType,
@@ -897,6 +898,11 @@ function startSubscribersServer() {
       ipc_spool_depth: bridgeMetrics.ipc_spool_depth || 0,
       ipc_spool_failures_total: bridgeMetrics.ipc_spool_failures_total || 0,
       ipc_send_backpressure_total: bridgeMetrics.ipc_send_backpressure_total || 0,
+      startup_reconciliation_last_run_at: bridgeMetrics.startup_reconciliation_last_run_at || null,
+      startup_reconciliation_traccar_devices: bridgeMetrics.startup_reconciliation_traccar_devices || 0,
+      startup_reconciliation_mongo_online: bridgeMetrics.startup_reconciliation_mongo_online || 0,
+      startup_reconciliation_marked_offline: bridgeMetrics.startup_reconciliation_marked_offline || 0,
+      startup_reconciliation_failures: bridgeMetrics.startup_reconciliation_failures || 0,
       persistence_health: persistenceHealth,
       gpspoint_spool_dir: writerStats.gpspoint_spool_dir,
       ts: new Date().toISOString(),
@@ -2691,6 +2697,7 @@ async function persistPositionHeavy(ctx) {
     blocked: attrs.blocked ?? null,
     rssi: attrs.rssi ?? null,
     alarm: attrs.alarm ?? null,
+    deviceStatus: doc?.deviceStatus,
 
 
 
@@ -2830,17 +2837,21 @@ function createTraccarBearerClient() {
 
 async function bootBridge() {
   startSubscribersServer();
-  void warmImeiToRoomCacheFromMongo();
-  startMileageScheduler();
-  startTravelStatsScheduler({ stopThresholdsMinutes: [1, 3, 5, 10, 15, 30, 60] });
-  startIdleStatsScheduler({ idleSpeedKph: 0, idleMinutes: 5, requireAccOn: true, maxGapSeconds: 10 * 60 });
-  startStaticStatsScheduler();
-
   traccarHttpClient = createTraccarBearerClient();
   console.log("Traccar REST client configured", {
     baseURL: TRACCAR_BASE,
     auth: "bearer",
   });
+  void warmImeiToRoomCacheFromMongo();
+  void runStartupConnectivityReconciliation({
+    traccarClient: traccarHttpClient,
+    metrics: bridgeMetrics,
+    log: console,
+  });
+  startMileageScheduler();
+  startTravelStatsScheduler({ stopThresholdsMinutes: [1, 3, 5, 10, 15, 30, 60] });
+  startIdleStatsScheduler({ idleSpeedKph: 0, idleMinutes: 5, requireAccOn: true, maxGapSeconds: 10 * 60 });
+  startStaticStatsScheduler();
 }
 
 async function gracefulShutdown(signal) {
