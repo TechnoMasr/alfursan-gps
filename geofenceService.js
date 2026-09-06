@@ -1,5 +1,4 @@
 const { DeviceStatus } = require('./mongo');
-const { getGpsLogsWriter } = require('./lib/gpsLogsWriter');
 
 function toRad(x) {
   return (x * Math.PI) / 180;
@@ -92,12 +91,12 @@ function fenceKey(fence) {
  * Evaluate fences for a point and generate events (enter/exit) based on DeviceStatus.fences.
  *
  * - Stores per-fence state in DeviceStatus.fence_state.<fenceId> = { inside, last_change_at, last_checked_at }
- * - Creates events in GpsLog as alarms:
+ * - Creates alarm event payloads for callers:
  *    - Exit  -> type='alarm', alarmType=1001
  *    - Enter -> type='alarm', alarmType=1000
  *    - Overspeed in zone -> type='alarm', alarmType=1002 (على انتقال بداية السرعة الزائدة فقط)
  *
- * Returns: Array of created GpsLog docs (plain objects).
+ * Returns: Array of created alarm event payloads (plain objects).
  */
 async function evaluateGeofences({ statusDoc, imei, lat, lon, speed, packetDate }) {
   const pointLat = Number(lat);
@@ -189,16 +188,6 @@ async function evaluateGeofences({ statusDoc, imei, lat, lon, speed, packetDate 
       }
     }
 
-    
-
-true
-
-Boolean
-
-20
-
-
-
     // 2) Overspeed inside zone (event on start only)
     const notifyOnOverspeed = !!(fence.speed_limit_enabled ?? fence.speed_limit);
     const limit = Number(  fence.speed_limit  );
@@ -244,8 +233,7 @@ Boolean
 
   if (!createdEvents.length) return [];
 
-  // gpslogs write is optional; callers still receive events for notify/realtime.
-  return getGpsLogsWriter().writeMany(createdEvents);
+  return createdEvents;
 }
 
 module.exports = {

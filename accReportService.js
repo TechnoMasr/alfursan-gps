@@ -6,7 +6,6 @@
  * All persistence is async.
  */
 const { AccEvent } = require("./mongo");
-const { getGpsLogsWriter } = require("./lib/gpsLogsWriter");
 
 const accState = new Map();
 
@@ -24,40 +23,6 @@ function persistAccEvent(payload) {
     } catch (err) {
       console.error("AccEvent persist error:", err.message);
     }
-  });
-}
-
-/**
- * تسجيل تغيّر حالة المحرك (ACC) في gps_logs بنفس أسلوب أحداث Traccar في persistEvent
- * — يُستدعى فقط عند إغلاق فترة ACC حقيقية (بعد persistAccEvent في الذاكرة).
- * skipGpsLog في handleAccSample يمنع التكرار عندما يكون الحدث قادماً من persistEvent (يوجد سجل حدث Traccar مسبقاً).
- */
-function persistAccChangeToGpsLog(payload) {
-  const accStatus = payload.acc_status === "on" ? "on" : "off";
-  const ar =
-    accStatus === "on"
-      ? `تشغيل المحرك (ACC) — المدة ${payload.duration_sec} ث`
-      : `إيقاف المحرك (ACC) — المدة ${payload.duration_sec} ث`;
-  const en =
-    accStatus === "on"
-      ? `ACC ON — duration ${payload.duration_sec}s`
-      : `ACC OFF — duration ${payload.duration_sec}s`;
-  getGpsLogsWriter().writeOneFireAndForget({
-    imei: payload.imei,
-    type: "alarm",
-    subType: "acc_change",
-    alarmType: "ACC",
-    alarmText: en,
-    alarmTextAr: ar,
-    packet_date: payload.end_time,
-    date: payload.end_time,
-    acc_status: accStatus,
-    triggered_by: payload.triggered_by || "ignition",
-    latitude: payload.end_lat ?? undefined,
-    longitude: payload.end_lon ?? undefined,
-    start_time: payload.start_time,
-    end_time: payload.end_time,
-    duration_sec: payload.duration_sec,
   });
 }
 
@@ -84,13 +49,12 @@ function powerEventToAccOn(eventType) {
  * @param {number|null} lat
  * @param {number|null} lon
  * @param {Date} packetDate
- * @param {{ triggeredBy?: string, skipGpsLog?: boolean }} [options] - skipGpsLog: true عند استدعاء من persistEvent (يوجد سجل Traccar event)
+ * @param {{ triggeredBy?: string }} [options]
  */
 function handleAccSample(imei, accOn, lat, lon, packetDate, options = {}) {
   if (!imei || typeof accOn !== "boolean") return;
 
   const triggeredBy = options.triggeredBy || "ignition";
-  const skipGpsLog = options.skipGpsLog === true;
   const prev = accState.get(imei);
   const packetTime = packetDate instanceof Date ? packetDate : new Date(packetDate);
 
@@ -126,10 +90,6 @@ function handleAccSample(imei, accOn, lat, lon, packetDate, options = {}) {
       triggered_by: prev.triggeredBy || "ignition",
     };
     persistAccEvent(accPayload);
-    // تسجيل في gps_logs لمتابعة التقارير (ما عدا عند تكرار حدث Traccar نفسه)
-    if (!skipGpsLog) {
-      persistAccChangeToGpsLog(accPayload);
-    }
   }
 
   if (!prev || prev.accOn !== accOn) {

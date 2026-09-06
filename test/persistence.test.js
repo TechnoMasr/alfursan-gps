@@ -5,7 +5,6 @@ const os = require("os");
 const path = require("path");
 const { createGpsPointWriter } = require("../lib/gpsPointWriter");
 const { createAnalyticsQueue } = require("../lib/analyticsQueue");
-const { createGpsLogsWriter } = require("../lib/gpsLogsWriter");
 
 function tmpDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -140,7 +139,6 @@ describe("gpspoints batch writer + spool", () => {
     await writer.flushAndStop(200);
   });
 });
-
 describe("analytics FIFO never coalesces or hangs", () => {
   it("processes every item in per-IMEI order", async () => {
     const seen = [];
@@ -178,42 +176,5 @@ describe("analytics FIFO never coalesces or hangs", () => {
       await new Promise((r) => setTimeout(r, 10));
     }
     assert.equal(processed, 50);
-  });
-});
-
-describe("gpslogs writer flag", () => {
-  it("default OFF does not write GpsLog", async () => {
-    let writes = 0;
-    const writer = createGpsLogsWriter({
-      enabled: false,
-      GpsLog: { insertMany: async (docs) => { writes += docs.length; return docs; } },
-      metrics: {},
-    });
-    const out = await writer.writeMany([{ imei: "1", type: "gps" }, { imei: "1", type: "alarm" }]);
-    assert.equal(writes, 0);
-    assert.equal(out.length, 2);
-  });
-
-  it("enabled writes to GpsLog", async () => {
-    let writes = 0;
-    const writer = createGpsLogsWriter({
-      enabled: true,
-      GpsLog: {
-        insertMany: async (docs) => {
-          writes += docs.length;
-          return docs;
-        },
-      },
-      metrics: {},
-    });
-    await writer.writeOne({ imei: "1", type: "gps" });
-    assert.equal(writes, 1);
-  });
-
-  it("disabled still returns geofence events for notify/realtime", async () => {
-    const writer = createGpsLogsWriter({ enabled: false, metrics: {} });
-    const events = [{ imei: "1", type: "alarm", subType: "geofence" }];
-    const out = await writer.writeMany(events);
-    assert.equal(out[0].subType, "geofence");
   });
 });

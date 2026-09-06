@@ -5,7 +5,6 @@ const os = require("os");
 const path = require("path");
 const { createGpsPointWriter, classifyInsertManyError } = require("../lib/gpsPointWriter");
 const { createPositionPipeline } = require("../lib/positionPipeline");
-const { createGpsLogsWriter } = require("../lib/gpsLogsWriter");
 const { loadBridgeEnv } = require("../lib/bridgeEnv");
 const { createBridgeMetrics, snapshotMetrics } = require("../lib/bridgeMetrics");
 const {
@@ -419,26 +418,6 @@ describe("durability: large spool fairness + realtime independence", () => {
   });
 });
 
-describe("durability: gpslogs remains OFF by default", () => {
-  it("env default is false and writer performs zero GpsLog inserts", async () => {
-    const env = loadBridgeEnv();
-    assert.equal(env.GPSLOGS_WRITE_ENABLED, false);
-    let writes = 0;
-    const writer = createGpsLogsWriter({
-      enabled: env.GPSLOGS_WRITE_ENABLED,
-      GpsLog: {
-        insertMany: async (docs) => {
-          writes += docs.length;
-          return docs;
-        },
-      },
-      metrics: {},
-    });
-    await writer.writeMany([{ type: "gps" }, { type: "alarm" }, { type: "gps" }]);
-    assert.equal(writes, 0);
-  });
-});
-
 describe("durability: classifyInsertManyError", () => {
   it("does not treat unrelated unique indexes as traccar_position_id idempotency", () => {
     const docs = [{ imei: "a", traccar_position_id: 1 }, { imei: "a", traccar_position_id: 2 }];
@@ -467,7 +446,6 @@ describe("durability: health snapshot fields", () => {
       event_loop_lag_ms: 1,
     });
     assert.equal(snap.persistence_dropped, 0);
-    assert.equal(snap.gpslogs_write_enabled, false);
     assert.equal(snap.gpspoints_spool_files, 2);
     assert.equal("event_loop_lag_ms" in snap, true);
   });

@@ -14,27 +14,8 @@ mongoose.connect(uri)
   .catch(err => console.error('❌ MongoDB connection error:', err.message));
 
 /**
- * 🔹 Collection 1: gps_logs
- * يحتوي على كل الحقول المفيدة باستثناء buffer
- */
-const gpsLogSchema = new mongoose.Schema(
-  {
-    imei: { type: String, index: true },
-    type: { type: String, index: true },
-    date: { type: Date, index: true },
-    // باقي الحقول ديناميكية (raw مفكوك)
-  },
-  {
-    strict: false,  // ⬅️ يسمح بإضافة أي حقل بدون تعريف
-    timestamps: true
-  }
-);
-
-gpsLogSchema.index({ imei: 1, date: -1 });
-
-/**
  * 🔹 Collection: gpspoints — lean track points for fast replay
- * (imei + lat/lng + speed + direction + packet_date)
+ * (imei + lat/lng + speed + direction + packet_date + ignition)
  */
 const gpsPointSchema = new mongoose.Schema(
   {
@@ -45,6 +26,7 @@ const gpsPointSchema = new mongoose.Schema(
     direction: { type: Number, default: 0 },
     packet_date: { type: Date, required: true, index: true },
     date: { type: Date, index: true },
+    ignition: { type: Boolean, default: null },
     traccar_position_id: { type: Number },
   },
   {
@@ -106,22 +88,6 @@ async function ensureTraccarRawIngressRetentionIndex() {
     if (err?.codeName !== "IndexNotFound" && err?.code !== 27) throw err;
   }
 }
-
-/** Every gps_logs row with type=alarm is mirrored to notifications. */
-gpsLogSchema.post("save", function (doc) {
-  if (doc?.type === "alarm") {
-    const { scheduleMirrorGpsAlarm } = require("./notificationStore");
-    scheduleMirrorGpsAlarm(doc);
-  }
-});
-
-gpsLogSchema.post("insertMany", function (docs) {
-  const list = Array.isArray(docs) ? docs : [];
-  const { scheduleMirrorGpsAlarm } = require("./notificationStore");
-  for (const doc of list) {
-    if (doc?.type === "alarm") scheduleMirrorGpsAlarm(doc);
-  }
-});
 
 /**
  * 🔹 Collection 2: gps_buffers
@@ -331,7 +297,7 @@ notificationSchema.index({ imei: 1, createdAt: -1 });
 notificationSchema.index({ imei: 1, alarmType: 1, createdAt: -1 });
 notificationSchema.index({ createdAt: -1 });
 
-// 🔹 Collection: overspeed_alerts (تقرير تجاوز السرعة - مستقل عن gpslogs)
+// 🔹 Collection: overspeed_alerts (تقرير تجاوز السرعة)
 const overspeedAlertSchema = new mongoose.Schema(
   {
     imei: { type: String, index: true },
@@ -351,7 +317,7 @@ const overspeedAlertSchema = new mongoose.Schema(
 overspeedAlertSchema.index({ imei: 1, start_time: -1 });
 overspeedAlertSchema.set('collection', 'overspeed_alerts');
 
-// 🔹 Collection: acc_events (تقرير حالة المحرك ACC - مستقل عن gpslogs، من ignition + تنبيهات الطاقة)
+// 🔹 Collection: acc_events (تقرير حالة المحرك ACC، من ignition + تنبيهات الطاقة)
 const accEventSchema = new mongoose.Schema(
   {
     imei: { type: String, index: true },
@@ -372,8 +338,6 @@ accEventSchema.set("collection", "acc_events");
 
 gpsBufferSchema.index({ imei: 1, date: -1 });
 
-const GpsLog = mongoose.model('GpsLog', gpsLogSchema);
-const GpsLog2 = mongoose.model('GpsLog', gpsLogSchema);
 const GpsPoint = mongoose.model('GpsPoint', gpsPointSchema);
 const TraccarIngressRaw = mongoose.model('TraccarIngressRaw', traccarIngressRawSchema);
 const GpsBuffer = mongoose.model('GpsBuffer', gpsBufferSchema);
@@ -390,8 +354,6 @@ const CommandResponse = mongoose.model('command_response', commandResponseSchema
 const Notification = mongoose.model('Notification', notificationSchema);
 
 module.exports = {
-  GpsLog,
-  GpsLog2,
   GpsPoint,
   TraccarIngressRaw,
   GpsBuffer,

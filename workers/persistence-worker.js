@@ -2,7 +2,6 @@ const path = require("path");
 
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
-const { configureGpsLogsWriter } = require("../lib/gpsLogsWriter");
 const { createGpsPointWriter } = require("../lib/gpsPointWriter");
 const { setGpsPointWriter, enqueueGpsPoint } = require("../gpsPointStore");
 const { upsertDeviceStatus } = require("../deviceStatus");
@@ -11,17 +10,19 @@ const { handleParkingSample } = require("../parkingEventsService");
 const { handleOverspeedSample } = require("../overspeedService");
 const { handleAccSample, powerEventToAccOn } = require("../accReportService");
 const { persistTenantNotification } = require("../notificationStore");
-const { handleIdleNotifySample, startIdleStatsScheduler } = require("../idleStatsService");
-const { startTravelStatsScheduler } = require("../travelStatsService");
-const { startStaticStatsScheduler } = require("../staticStatsService");
+const { handleIdleNotifySample } = require("../idleStatsService");
 const { sendPushNotification } = require("../fcm.service");
 const Trip = require("../trip");
 const mongoose = require("mongoose");
-const { GpsLog, GpsPoint } = require("../mongo");
+const { GpsPoint } = require("../mongo");
 
-const GPSLOGS_WRITE_ENABLED = String(process.env.GPSLOGS_WRITE_ENABLED ?? "0") === "1";
 const BRIDGE_LATENCY_DEBUG = String(process.env.BRIDGE_LATENCY_DEBUG ?? "0") === "1";
 const BASE_GAP_MIN = Number(process.env.BASE_GAP_MIN ?? 1) || 1;
+const BUSINESS_QUEUE_MAX = Number(process.env.BUSINESS_QUEUE_MAX || 20_000) || 20_000;
+const BUSINESS_CONCURRENCY = Number(process.env.BUSINESS_CONCURRENCY || 64) || 64;
+const DEVICE_STATUS_PERSIST_INTERVAL_MS =
+  Number(process.env.DEVICE_STATUS_PERSIST_INTERVAL_MS || 10_000) || 10_000;
+const TRIP_FLUSH_INTERVAL_MS = Number(process.env.TRIP_FLUSH_INTERVAL_MS || 10_000) || 10_000;
 
 const bridgeMetrics = {
   gpspoints_received_total: 0,
@@ -31,6 +32,15 @@ const bridgeMetrics = {
   gpspoints_retry_total: 0,
   gpspoints_persist_failures: 0,
   live_device_fallback_rejected_total: 0,
+  business_queue_depth: 0,
+  business_queue_rejected_or_coalesced_total: 0,
+  business_processing_lag_ms: 0,
+  business_processed_total: 0,
+  device_status_dirty_count: 0,
+  device_status_flush_total: 0,
+  device_status_skipped_total: 0,
+  trip_dirty_count: 0,
+  trip_flush_total: 0,
 };
 
 function num(value, fallback = 0) {
@@ -60,13 +70,6 @@ function isValidGpsCoord(lat, lon) {
   return Number.isFinite(a) && Number.isFinite(b) && !(a === 0 && b === 0);
 }
 
-const gpsLogsWriter = configureGpsLogsWriter({
-  enabled: GPSLOGS_WRITE_ENABLED,
-  GpsLog,
-  onAlarm: () => {},
-  metrics: bridgeMetrics,
-});
-
 const gpsPointWriter = createGpsPointWriter({
   insertMany: (docs) => GpsPoint.insertMany(docs, { ordered: false }),
   spoolDir: process.env.GPSPOINT_SPOOL_DIR || undefined,
@@ -79,6 +82,16 @@ const gpsPointWriter = createGpsPointWriter({
 setGpsPointWriter(gpsPointWriter);
 
 const tripState = new Map();
+const tripFlushState = new Map();
+const deviceStatusStateByImei = new Map();
+const deviceStatusDirtyByImei = new Map();
+const deviceStatusDocByImei = new Map();
+const businessQueuesByImei = new Map();
+const businessReadyImeis = [];
+const businessActiveImeis = new Set();
+const businessQueuedImeis = new Set();
+let totalBusinessQueued = 0;
+let businessRunning = 0;
 
 const WORKER_METRIC_KEYS = [
   "gpspoints_queue_depth",
@@ -102,6 +115,15 @@ const WORKER_METRIC_KEYS = [
   "gpspoint_spool_dir",
   "disk_free_bytes",
   "persistence_dropped",
+  "business_queue_depth",
+  "business_queue_rejected_or_coalesced_total",
+  "business_processing_lag_ms",
+  "business_processed_total",
+  "device_status_dirty_count",
+  "device_status_flush_total",
+  "device_status_skipped_total",
+  "trip_dirty_count",
+  "trip_flush_total",
 ];
 
 function publishWorkerMetrics() {
@@ -151,21 +173,51 @@ async function startTrip(imei, startAt, lat, lon) {
   });
 }
 
+async function flushTrip(tripId) {
+  const pending = tripFlushState.get(String(tripId));
+  if (!pending) return;
+  const update = {
+    $set: {
+      end_at: pending.end_at,
+      end_lat: pending.end_lat,
+      end_lon: pending.end_lon,
+    },
+  };
+  if (pending.distance_km_inc > 0) {
+    update.$inc = { distance_km: pending.distance_km_inc };
+  }
+  await Trip.updateOne({ _id: tripId }, update);
+  tripFlushState.delete(String(tripId));
+  bridgeMetrics.trip_flush_total += 1;
+  bridgeMetrics.trip_dirty_count = tripFlushState.size;
+}
+
 async function closeTripAtLastMove(st) {
   if (!st?.currentTripId) return;
+  await flushTrip(st.currentTripId);
   await Trip.updateOne({ _id: st.currentTripId }, { $set: { is_open: false, end_at: st.lastNonZeroAt || new Date() } });
   st.currentTripId = null;
 }
 
 async function appendToTrip(tripId, packetDate, lat, lon, addKm) {
   if (!tripId) return;
-  await Trip.updateOne(
-    { _id: tripId },
-    {
-      $set: { end_at: packetDate, end_lat: lat ?? null, end_lon: lon ?? null },
-      $inc: { distance_km: addKm || 0, duration_min: 0 },
-    }
-  );
+  const key = String(tripId);
+  const existing = tripFlushState.get(key);
+  const pending = existing || {
+    tripId,
+    distance_km_inc: 0,
+    lastFlushAt: Date.now(),
+  };
+  pending.end_at = packetDate;
+  pending.end_lat = lat ?? null;
+  pending.end_lon = lon ?? null;
+  pending.distance_km_inc += addKm || 0;
+  tripFlushState.set(key, pending);
+  bridgeMetrics.trip_dirty_count = tripFlushState.size;
+  if (Date.now() - pending.lastFlushAt >= TRIP_FLUSH_INTERVAL_MS) {
+    pending.lastFlushAt = Date.now();
+    await flushTrip(tripId);
+  }
 }
 
 async function applyTripLogic({ imei, doc, packetDate }) {
@@ -215,6 +267,102 @@ async function applyTripLogic({ imei, doc, packetDate }) {
   st.prevPacketAt = packetDate;
 }
 
+function deviceStatusTransitionKey({ doc, attrs } = {}) {
+  return JSON.stringify({
+    type: doc?.type || null,
+    attrsType: attrs?.type ?? null,
+    ignition: attrs?.ignition ?? null,
+    motion: attrs?.motion ?? null,
+    charge: attrs?.charge ?? null,
+    blocked: attrs?.blocked ?? null,
+    alarm: attrs?.alarm ?? null,
+  });
+}
+
+async function persistDeviceStatus(ctx, { force = false } = {}) {
+  const {
+    imei,
+    doc,
+    attrs,
+    latitude,
+    longitude,
+    speed,
+    direction,
+    packetDate,
+    serverDate,
+    hasValidCoords,
+  } = ctx;
+  const state = deviceStatusStateByImei.get(imei) || { lastPersistAt: 0, transitionKey: null };
+  const key = deviceStatusTransitionKey({ doc, attrs });
+  const nowMs = Date.now();
+  const due = nowMs - state.lastPersistAt >= DEVICE_STATUS_PERSIST_INTERVAL_MS;
+  if (!force && state.transitionKey === key && !due) {
+    deviceStatusDirtyByImei.set(imei, ctx);
+    bridgeMetrics.device_status_dirty_count = deviceStatusDirtyByImei.size;
+    bridgeMetrics.device_status_skipped_total += 1;
+    return deviceStatusDocByImei.get(imei) || null;
+  }
+
+  const statusDoc = await upsertDeviceStatus({
+    imei,
+    packetDate,
+    serverDate,
+    lat: hasValidCoords ? latitude : undefined,
+    lon: hasValidCoords ? longitude : undefined,
+    speed,
+    type: doc.type,
+    attrsType: attrs?.type,
+    voltageUnit: attrs?.power != null ? "v" : undefined,
+    direction,
+    voltage: attrs?.power ?? attrs?.battery ?? attrs?.batteryLevel,
+    batteryLevel: attrs?.batteryLevel ?? attrs?.battery,
+    ignition: attrs?.ignition ?? null,
+    motion: attrs?.motion ?? null,
+    charge: attrs?.charge ?? null,
+    blocked: attrs?.blocked ?? null,
+    rssi: attrs?.rssi ?? null,
+    alarm: attrs?.alarm ?? null,
+  });
+  deviceStatusStateByImei.set(imei, { lastPersistAt: nowMs, transitionKey: key });
+  deviceStatusDirtyByImei.delete(imei);
+  deviceStatusDocByImei.set(imei, statusDoc);
+  bridgeMetrics.device_status_dirty_count = deviceStatusDirtyByImei.size;
+  bridgeMetrics.device_status_flush_total += 1;
+  return statusDoc;
+}
+
+async function flushDirtyDeviceStatus(limit = 500) {
+  let flushed = 0;
+  for (const [imei, ctx] of deviceStatusDirtyByImei.entries()) {
+    if (flushed >= limit) break;
+    const state = deviceStatusStateByImei.get(imei) || { lastPersistAt: 0 };
+    if (Date.now() - state.lastPersistAt < DEVICE_STATUS_PERSIST_INTERVAL_MS) continue;
+    try {
+      await persistDeviceStatus(ctx, { force: true });
+      flushed += 1;
+    } catch (err) {
+      console.warn("DeviceStatus dirty flush error:", err.message);
+    }
+  }
+  bridgeMetrics.device_status_dirty_count = deviceStatusDirtyByImei.size;
+}
+
+async function flushDirtyTrips(limit = 500) {
+  let flushed = 0;
+  for (const pending of Array.from(tripFlushState.values())) {
+    if (flushed >= limit) break;
+    if (Date.now() - pending.lastFlushAt < TRIP_FLUSH_INTERVAL_MS) continue;
+    try {
+      pending.lastFlushAt = Date.now();
+      await flushTrip(pending.tripId);
+      flushed += 1;
+    } catch (err) {
+      console.warn("Trip dirty flush error:", err.message);
+    }
+  }
+  bridgeMetrics.trip_dirty_count = tripFlushState.size;
+}
+
 async function SEND_NOTIFY_TO_CLIENT(imei, title, body, data = {}) {
   try {
     if (!imei) return null;
@@ -252,7 +400,63 @@ async function SEND_NOTIFY_TO_CLIENT(imei, title, body, data = {}) {
   }
 }
 
-async function processPositionItem(ctx) {
+function queueImei(imei) {
+  if (businessQueuedImeis.has(imei) || businessActiveImeis.has(imei)) return;
+  businessQueuedImeis.add(imei);
+  businessReadyImeis.push(imei);
+}
+
+function scheduleBusinessPump() {
+  setImmediate(pumpBusinessQueue);
+}
+
+function enqueueBusiness(ctx) {
+  const imei = ctx?.imei ? String(ctx.imei) : "";
+  if (!imei) return;
+  let queue = businessQueuesByImei.get(imei);
+  if (!queue) {
+    queue = [];
+    businessQueuesByImei.set(imei, queue);
+  }
+  if (totalBusinessQueued >= BUSINESS_QUEUE_MAX) {
+    if (queue.length) {
+      queue[queue.length - 1] = { ...ctx, businessEnqueuedAt: Date.now() };
+      bridgeMetrics.business_queue_rejected_or_coalesced_total += 1;
+      scheduleBusinessPump();
+      return;
+    }
+    bridgeMetrics.business_queue_rejected_or_coalesced_total += 1;
+    return;
+  }
+  queue.push({ ...ctx, businessEnqueuedAt: Date.now() });
+  totalBusinessQueued += 1;
+  bridgeMetrics.business_queue_depth = totalBusinessQueued;
+  queueImei(imei);
+  scheduleBusinessPump();
+}
+
+function processPositionItem(ctx) {
+  const { imei, doc, attrs, latitude, longitude, speedRounded, direction, packetDate, serverDate, hasValidCoords } = ctx || {};
+  if (!imei || !doc) return;
+  if ((doc.type === "gps" || doc.type === "alarm") && hasValidCoords) {
+    enqueueGpsPoint({
+      type: doc.type,
+      imei,
+      latitude,
+      longitude,
+      speed: speedRounded,
+      direction,
+      packet_date: packetDate,
+      date: serverDate,
+      ignition: typeof attrs?.ignition === "boolean" ? attrs.ignition : null,
+      attrsType: attrs?.type,
+      traccar_position_id: doc.traccar_position_id ?? doc?.id ?? null,
+    });
+  }
+  enqueueBusiness(ctx);
+}
+
+async function processBusinessItem(ctx) {
   const {
     imei,
     doc,
@@ -273,7 +477,6 @@ async function processPositionItem(ctx) {
 
   if (!imei || !doc) return;
 
-  gpsLogsWriter.writeOneFireAndForget(doc);
   setImmediate(() => {
     handleIdleNotifySample(
       imei,
@@ -290,19 +493,6 @@ async function processPositionItem(ctx) {
         requireAccOn: true,
         onIdleConfirmed: async ({ imei: im, idleStart, packetDate: pd, lat, lon }) => {
           try {
-            gpsLogsWriter.writeOneFireAndForget({
-              imei: im,
-              type: "alarm",
-              subType: "idle",
-              alarmType: "IDLE",
-              alarmText: `Vehicle idle since ${idleStart?.toISOString?.() || ""}`,
-              alarmTextAr: "المركبة في حالة خمول: المحرك يعمل والسرعة منخفضة/صفر لمدة لا تقل عن 5 دقائق",
-              packet_date: pd,
-              date: pd,
-              latitude: lat ?? undefined,
-              longitude: lon ?? undefined,
-              idle_start: idleStart,
-            });
             if (!isHistorical) {
               await SEND_NOTIFY_TO_CLIENT(im, `خمول ${im}`, "المركبة في حالة خمول (محرك يعمل وسرعة صفر/منخفضة)", {
                 type: "alarm",
@@ -317,29 +507,19 @@ async function processPositionItem(ctx) {
               });
             }
           } catch (e) {
-            console.error("Idle GpsLog/notify error:", e.message);
+            console.error("Idle notify error:", e.message);
           }
         },
       }
     );
   });
-  if (doc.type === "gps" && hasValidCoords) {
-    enqueueGpsPoint({
-      type: doc.type,
-      imei,
-      latitude,
-      longitude,
-      speed: speedRounded,
-      direction,
-      packet_date: packetDate,
-      date: serverDate,
-      attrsType: attrs?.type,
-      traccar_position_id: doc.traccar_position_id ?? doc?.id ?? null,
-    });
-  }
 
   if (hasValidCoords) {
-    await handleParkingSample({ imei, timestamp: packetDate, lat: latitude, lon: longitude, speed });
+    try {
+      await handleParkingSample({ imei, timestamp: packetDate, lat: latitude, lon: longitude, speed });
+    } catch (err) {
+      console.warn("Parking sample error:", err.message);
+    }
   }
 
   setImmediate(() => {
@@ -347,20 +527,6 @@ async function processPositionItem(ctx) {
       alarmCodes: alarmCodesForOverspeed,
       hooks: isHistorical ? {} : {
         onOverspeedStart: async (payload) => {
-          gpsLogsWriter.writeOneFireAndForget({
-            imei: payload.imei,
-            type: "alarm",
-            subType: "overspeed_start",
-            alarmType: "OVERSPEED",
-            alarmText: `Overspeed started (limit ${payload.speed_limit_kmh ?? "?"} km/h)`,
-            alarmTextAr: `بدء تجاوز السرعة (الحد ${payload.speed_limit_kmh ?? "—"} كم/س)`,
-            packet_date: payload.packetDate,
-            date: payload.packetDate,
-            latitude: payload.lat ?? undefined,
-            longitude: payload.lon ?? undefined,
-            speed: round1(payload.speed),
-            speed_limit_kmh: payload.speed_limit_kmh,
-          });
           await SEND_NOTIFY_TO_CLIENT(payload.imei, `تنبيه ${payload.imei}`, `بدء تجاوز السرعة — السرعة الحالية تقريباً ${round1(payload.speed)} كم/س`, {
             type: "alarm",
             subType: "overspeed_start",
@@ -368,23 +534,7 @@ async function processPositionItem(ctx) {
             alarmTextAr: `بدء تجاوز السرعة (الحد ${payload.speed_limit_kmh ?? "—"} كم/س)`,
           });
         },
-        onOverspeedEnd: async (payload) => {
-          gpsLogsWriter.writeOneFireAndForget({
-            imei: payload.imei,
-            type: "alarm",
-            subType: "overspeed_end",
-            alarmType: "OVERSPEED",
-            alarmText: `Overspeed ended: max ${payload.speed_kmh} km/h`,
-            alarmTextAr: `انتهاء تجاوز السرعة — أقصى سرعة ${payload.speed_kmh} كم/س`,
-            packet_date: payload.end_time,
-            date: payload.end_time,
-            latitude: payload.end_lat ?? undefined,
-            longitude: payload.end_lon ?? undefined,
-            speed: payload.speed_kmh,
-            duration_sec: payload.duration_sec,
-            distance_km: payload.distance_km,
-          });
-        },
+        onOverspeedEnd: async () => {},
       },
     }).catch((e) => console.warn("Overspeed sample error:", e.message));
   });
@@ -408,30 +558,17 @@ async function processPositionItem(ctx) {
     }
   });
 
-  await upsertDeviceStatus({
-    imei,
-    packetDate,
-    serverDate,
-    lat: hasValidCoords ? latitude : undefined,
-    lon: hasValidCoords ? longitude : undefined,
-    speed,
-    type: doc.type,
-    attrsType: attrs?.type,
-    voltageUnit: attrs?.power != null ? "v" : undefined,
-    direction,
-    voltage: attrs?.power ?? attrs?.battery ?? attrs?.batteryLevel,
-    batteryLevel: attrs?.batteryLevel ?? attrs?.battery,
-    ignition: attrs?.ignition ?? null,
-    motion: attrs?.motion ?? null,
-    charge: attrs?.charge ?? null,
-    blocked: attrs?.blocked ?? null,
-    rssi: attrs?.rssi ?? null,
-    alarm: attrs?.alarm ?? null,
-  });
+  let statusDoc = null;
+  try {
+    statusDoc = await persistDeviceStatus(ctx);
+  } catch (err) {
+    console.warn("DeviceStatus update error:", err.message);
+  }
 
   if ((doc.type === "gps" || doc.type === "alarm") && hasValidCoords) {
     try {
       const fenceEvents = await evaluateGeofences({
+        statusDoc,
         imei,
         lat: latitude,
         lon: longitude,
@@ -439,7 +576,6 @@ async function processPositionItem(ctx) {
         packetDate,
       });
       for (const evt of fenceEvents) {
-        gpsLogsWriter.writeOneFireAndForget(evt);
         if (!isHistorical) {
           await SEND_NOTIFY_TO_CLIENT(imei, `تنبيه ${imei}`, evt?.alarmTextAr || evt?.alarmText || "تنبيه من الجهاز", evt);
         }
@@ -449,7 +585,11 @@ async function processPositionItem(ctx) {
     }
   }
 
-  await applyTripLogic({ imei, doc, packetDate });
+  try {
+    await applyTripLogic({ imei, doc, packetDate });
+  } catch (err) {
+    console.warn("Trip logic error:", err.message);
+  }
 
   if (doc.type === "alarm" && !isHistorical && !ignoredAlarmOnly) {
     await SEND_NOTIFY_TO_CLIENT(imei, `تنبيه ${imei}`, doc.alarmTextAr || "تنبيه من الجهاز", {
@@ -464,6 +604,41 @@ async function processPositionItem(ctx) {
       longitude,
       speed: speedRounded,
     });
+  }
+}
+
+async function pumpBusinessQueue() {
+  while (businessRunning < BUSINESS_CONCURRENCY && businessReadyImeis.length) {
+    const imei = businessReadyImeis.shift();
+    businessQueuedImeis.delete(imei);
+    if (businessActiveImeis.has(imei)) continue;
+    const queue = businessQueuesByImei.get(imei);
+    const item = queue?.shift();
+    if (!item) {
+      businessQueuesByImei.delete(imei);
+      continue;
+    }
+    businessActiveImeis.add(imei);
+    totalBusinessQueued = Math.max(0, totalBusinessQueued - 1);
+    bridgeMetrics.business_queue_depth = totalBusinessQueued;
+    businessRunning += 1;
+    void processBusinessItem(item)
+      .catch((err) => console.warn("Business persistence error:", err.message))
+      .finally(() => {
+        const lag = Date.now() - (item.businessEnqueuedAt || Date.now());
+        bridgeMetrics.business_processing_lag_ms = Math.max(0, lag);
+        bridgeMetrics.business_processed_total += 1;
+        businessRunning -= 1;
+        businessActiveImeis.delete(imei);
+        const remaining = businessQueuesByImei.get(imei);
+        if (remaining?.length) {
+          queueImei(imei);
+        } else {
+          businessQueuesByImei.delete(imei);
+        }
+        bridgeMetrics.business_queue_depth = totalBusinessQueued;
+        scheduleBusinessPump();
+      });
   }
 }
 
@@ -494,11 +669,14 @@ process.on("message", async (msg) => {
   }
 });
 
-startIdleStatsScheduler();
-startTravelStatsScheduler();
-startStaticStatsScheduler();
-
 const workerMetricsTimer = setInterval(publishWorkerMetrics, 5000);
 if (typeof workerMetricsTimer.unref === "function") workerMetricsTimer.unref();
+
+const dirtyFlushTimer = setInterval(() => {
+  void flushDirtyDeviceStatus().then(() => flushDirtyTrips()).catch((err) => {
+    console.warn("Dirty persistence flush error:", err.message);
+  });
+}, Math.max(1000, Math.min(DEVICE_STATUS_PERSIST_INTERVAL_MS, TRIP_FLUSH_INTERVAL_MS)));
+if (typeof dirtyFlushTimer.unref === "function") dirtyFlushTimer.unref();
 
 if (process.send) process.send({ type: "ready" });

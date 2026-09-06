@@ -8,6 +8,8 @@ const { OverspeedAlert } = require("./mongo");
 const { calcDistanceDiffSafe } = require("./gpsJumpGuard");
 
 const activeOverspeed = new Map();
+const speedLimitCache = new Map();
+const SPEED_LIMIT_CACHE_MS = Number(process.env.OVERSPEED_LIMIT_CACHE_MS || 60_000) || 60_000;
 
 function num(value, fallback = 0) {
   const n = Number(value);
@@ -24,22 +26,35 @@ function isFiniteCoord(lat, lon) {
  */
 async function getSpeedLimit(imei) {
   if (!imei) return null;
+  const key = String(imei);
+  const cached = speedLimitCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
   try {
     const doc = await mongoose.connection
       .collection("devicestatuses")
       .findOne({ imei }, { projection: { alert_speed_limit_value: 1 } });
     const v = doc?.alert_speed_limit_value;
-    if (v === undefined || v === null || v === "") return null;
+    if (v === undefined || v === null || v === "") {
+      speedLimitCache.set(key, { value: null, expiresAt: Date.now() + SPEED_LIMIT_CACHE_MS });
+      return null;
+    }
     const n = Number(v);
-    return Number.isFinite(n) && n > 0 ? n : null;
+    const value = Number.isFinite(n) && n > 0 ? n : null;
+    speedLimitCache.set(key, { value, expiresAt: Date.now() + SPEED_LIMIT_CACHE_MS });
+    return value;
   } catch (err) {
     return null;
   }
 }
 
+function clearSpeedLimitCache(imei = null) {
+  if (imei == null) speedLimitCache.clear();
+  else speedLimitCache.delete(String(imei));
+}
+
 /**
  * Persist one overspeed alert record (async, non-blocking).
- * hooks.afterPersist: يُستدعى بعد نجاح الحفظ (إشعار + GpsLog من traccar-bridge).
+ * hooks.afterPersist: called after a successful overspeed alert write.
  */
 function persistOverspeedAlert(payload, hooks) {
   setImmediate(async () => {
@@ -193,4 +208,5 @@ function round1(value) {
 module.exports = {
   getSpeedLimit,
   handleOverspeedSample,
+  clearSpeedLimitCache,
 };

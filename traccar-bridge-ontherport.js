@@ -9,11 +9,8 @@ const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const Trip = require("./trip");
-const { GpsLog, GpsPoint, GpsBuffer, CommandResponse, Notification, TraccarIngressRaw } = require("./mongo");
-const {
-  backfillGpsPointsFromLogs,
-  normalizeTraccarPositionId,
-} = require("./gpsPointStore");
+const { GpsPoint, GpsBuffer, CommandResponse, Notification, TraccarIngressRaw } = require("./mongo");
+const { normalizeTraccarPositionId } = require("./gpsPointStore");
 const { upsertDeviceStatus } = require("./deviceStatus");
 const { loadBridgeEnv } = require("./lib/bridgeEnv");
 const {
@@ -24,7 +21,6 @@ const {
   recordLiveClockSplit,
 } = require("./lib/liveEligibility");
 const { createBridgeMetrics, recordLiveDecision, snapshotMetrics } = require("./lib/bridgeMetrics");
-const { configureGpsLogsWriter } = require("./lib/gpsLogsWriter");
 const { createAnalyticsQueue } = require("./lib/analyticsQueue");
 const { createPersistenceIpc } = require("./lib/persistenceIpc");
 const { createWsDelivery } = require("./lib/wsDelivery");
@@ -46,7 +42,6 @@ const {
   isJsonContentType,
   normalizeForwardPayload,
 } = require("./lib/traccarForwardIngress");
-const { scheduleMirrorGpsAlarm } = require("./notificationStore");
 const {
   mergeStickyAttributesForImei,
   applyStickyTelemetryToStatusSet,
@@ -78,8 +73,7 @@ const LIVE_DEVICE_TIME_MAX_AGE_MS = BRIDGE_ENV.LIVE_DEVICE_TIME_MAX_AGE_MS;
 const LIVE_DEVICE_TIME_FUTURE_TOLERANCE_MS = BRIDGE_ENV.LIVE_DEVICE_TIME_FUTURE_TOLERANCE_MS;
 const LIVE_DEVICE_SERVER_MAX_SKEW_MS = BRIDGE_ENV.LIVE_DEVICE_SERVER_MAX_SKEW_MS;
 const SUBSCRIBER_HEARTBEAT_MS = BRIDGE_ENV.SUBSCRIBER_HEARTBEAT_MS;
-const GPSLOGS_WRITE_ENABLED = BRIDGE_ENV.GPSLOGS_WRITE_ENABLED;
-/** Alarms suppressed from GpsLog, FCM, and WebSocket subscribers (lowbattery is sent). */
+/** Alarms suppressed from FCM and WebSocket subscribers (lowbattery is sent). */
 const IGNORED_ALARM_CODES = new Set(["tampering"  , "lowbattery"]);
 // ====================
 
@@ -113,7 +107,6 @@ let shuttingDown = false;
 let subscribersWss = null;
 const liveFixTracker = createLiveFixTracker();
 const bridgeMetrics = createBridgeMetrics();
-bridgeMetrics.gpslogs_write_enabled = GPSLOGS_WRITE_ENABLED;
 const rawIngressWriter = createTraccarRawIngressWriter({
   insertMany: (docs) => TraccarIngressRaw.insertMany(docs, { ordered: true }),
   spoolDir: path.join(__dirname, "data", "traccar-raw-ingress-spool"),
@@ -125,15 +118,6 @@ const rawIngressWriter = createTraccarRawIngressWriter({
 });
 /** Per-IMEI broadcast ordering guard (tenant room + subscribers). */
 const lastBroadcastPacketMsByImei = new Map();
-const gpsLogsWriter = {
-  writeOneFireAndForget() {},
-  getStats() {
-    return {
-      gpslogs_write_enabled: GPSLOGS_WRITE_ENABLED,
-    };
-  },
-  flushAndStop: async () => ({ elapsed_ms: 0 }),
-};
 const gpsPointWriter = {
   getSpoolDir: () => BRIDGE_ENV.GPSPOINT_SPOOL_DIR || null,
   getStats: () => ({
@@ -152,6 +136,7 @@ const persistenceIpc = createPersistenceIpc({
   metrics: bridgeMetrics,
   maxQueueBatches: BRIDGE_ENV.PERSISTENCE_IPC_MAX_QUEUE_BATCHES || 512,
   maxBatchSize: BRIDGE_ENV.PERSISTENCE_IPC_MAX_BATCH_SIZE || 2000,
+  spoolDir: BRIDGE_ENV.PERSISTENCE_IPC_SPOOL_DIR,
 });
 console.log(`persistence_worker_pid=${persistenceIpc.getWorkerPid() || "starting"}`);
 const eventLoopLag = createEventLoopLagMonitor();
@@ -867,7 +852,6 @@ function startSubscribersServer() {
     bridgeMetrics.traccar_ingress = "http-forward";
     bridgeMetrics.forward_queue_depth = forwardQueue.getDepth();
     Object.assign(bridgeMetrics, rawIngressWriter.getStats());
-    bridgeMetrics.gpslogs_write_enabled = GPSLOGS_WRITE_ENABLED;
     const localWriterStats = gpsPointWriter.getStats();
     const writerStats = {
       ...localWriterStats,
@@ -904,7 +888,10 @@ function startSubscribersServer() {
       raw_ingress_spool_depth: bridgeMetrics.raw_ingress_spool_depth || 0,
       raw_ingress_last_received_at: bridgeMetrics.raw_ingress_last_received_at || null,
       raw_ingress_last_persisted_at: bridgeMetrics.raw_ingress_last_persisted_at || null,
-      gpslogs_write_enabled: GPSLOGS_WRITE_ENABLED,
+      ipc_spooled_batches_total: bridgeMetrics.ipc_spooled_batches_total || 0,
+      ipc_spool_depth: bridgeMetrics.ipc_spool_depth || 0,
+      ipc_spool_failures_total: bridgeMetrics.ipc_spool_failures_total || 0,
+      ipc_send_backpressure_total: bridgeMetrics.ipc_send_backpressure_total || 0,
       persistence_health: persistenceHealth,
       gpspoint_spool_dir: writerStats.gpspoint_spool_dir,
       ts: new Date().toISOString(),
@@ -990,37 +977,6 @@ function startSubscribersServer() {
       invalid: normalized.invalid.length,
       queue_depth: queued.depth,
     });
-  });
-
-  /**
-   * Backfill lean gpspoints from gpslogs (type=gps) for the last N days (default 30).
-   * Example: http://127.0.0.1:3053/gpspoints/backfill?days=30
-   * Optional: imei=..., dry_run=1, limit_per_batch=2000
-   */
-  app.get("/gpspoints/backfill", async (req, res) => {
-    try {
-      const days = Number(req.query.days) || 30;
-      const limitPerBatch = Number(req.query.limit_per_batch) || 2000;
-      const imei = req.query.imei ? String(req.query.imei).trim() : null;
-      const dryRun =
-        String(req.query.dry_run ?? req.query.dryRun ?? "0") === "1";
-      const replace =
-        String(req.query.replace ?? "0") === "1";
-
-      console.log("[gpspoints] backfill start", { days, imei, dryRun, replace, limitPerBatch });
-      const result = await backfillGpsPointsFromLogs({
-        days,
-        limitPerBatch,
-        imei,
-        dryRun,
-        replace,
-      });
-      console.log("[gpspoints] backfill done", result);
-      return res.json(result);
-    } catch (err) {
-      console.error("[gpspoints] backfill error:", err.message);
-      return res.status(500).json({ ok: false, error: err.message });
-    }
   });
 
   /**
@@ -1893,23 +1849,9 @@ async function SEND_NOTIFY_TO_CLIENT(imei, title, body, data = {}) {
   }
 }
 
-// ===== hooks تجاوز السرعة: تسجيل في GpsLog + إشعار (لا يغيّر منطق overspeedService الأساسي) =====
+// ===== hooks تجاوز السرعة: إشعارات فقط (لا يغيّر منطق overspeedService الأساسي) =====
 async function traccarOverspeedOnStart({ imei, packetDate, lat, lon, speed, speed_limit_kmh }) {
   try {
-    gpsLogsWriter.writeOneFireAndForget({
-      imei,
-      type: "alarm",
-      subType: "overspeed_start",
-      alarmType: "OVERSPEED",
-      alarmText: `Overspeed started (limit ${speed_limit_kmh ?? "?"} km/h)`,
-      alarmTextAr: `بدء تجاوز السرعة (الحد ${speed_limit_kmh ?? "—"} كم/س)`,
-      packet_date: packetDate,
-      date: packetDate,
-      latitude: lat ?? undefined,
-      longitude: lon ?? undefined,
-      speed: round1(speed),
-      speed_limit_kmh: speed_limit_kmh,
-    });
     await SEND_NOTIFY_TO_CLIENT(
       imei,
       `تنبيه ${imei}`,
@@ -1928,27 +1870,12 @@ async function traccarOverspeedOnStart({ imei, packetDate, lat, lon, speed, spee
       }
     );
   } catch (e) {
-    console.error("overspeed start GpsLog/notify error:", e.message);
+    console.error("overspeed start notify error:", e.message);
   }
 }
 
 async function traccarOverspeedOnEnd(payload) {
   try {
-    gpsLogsWriter.writeOneFireAndForget({
-      imei: payload.imei,
-      type: "alarm",
-      subType: "overspeed_end",
-      alarmType: "OVERSPEED",
-      alarmText: `Overspeed ended: max ${payload.speed_kmh} km/h, ${payload.duration_sec}s`,
-      alarmTextAr: `انتهاء تجاوز السرعة — أقصى سرعة ${payload.speed_kmh} كم/س، المدة ${payload.duration_sec} ث`,
-      packet_date: payload.end_time,
-      date: payload.end_time,
-      latitude: payload.end_lat ?? undefined,
-      longitude: payload.end_lon ?? undefined,
-      speed: payload.speed_kmh,
-      duration_sec: payload.duration_sec,
-      distance_km: payload.distance_km,
-    });
     await SEND_NOTIFY_TO_CLIENT(
       payload.imei,
       `تنبيه ${payload.imei}`,
@@ -1968,7 +1895,7 @@ async function traccarOverspeedOnEnd(payload) {
       }
     );
   } catch (e) {
-    console.error("overspeed end GpsLog/notify error:", e.message);
+    console.error("overspeed end notify error:", e.message);
   }
 }
 
@@ -2179,8 +2106,6 @@ async function persistCommandResponseBackground(
   commandResponseText,
   wirePayload
 ) {
-  gpsLogsWriter.writeOneFireAndForget(doc);
-
   try {
     const responseArTitle = "تم استلام الرد على الأمر";
     const responseEnTitle = "Command response received";
@@ -2573,12 +2498,49 @@ function persistPositionBody(imei, position, rawPayload, options = {}) {
   }
 
   bridgeMetrics.persistence_enqueue_at = new Date().toISOString();
+  const persistenceAttrs = {
+    ignition: typeof attrs?.ignition === "boolean" ? attrs.ignition : null,
+    motion: attrs?.motion ?? null,
+    charge: attrs?.charge ?? null,
+    blocked: attrs?.blocked ?? null,
+    power: attrs?.power ?? null,
+    battery: attrs?.battery ?? null,
+    batteryLevel: attrs?.batteryLevel ?? null,
+    rssi: attrs?.rssi ?? null,
+    alarm: attrs?.alarm ?? null,
+    type: attrs?.type ?? null,
+  };
+  const persistenceDoc = {
+    imei: doc.imei,
+    type: doc.type,
+    subType: doc.subType,
+    alarmType: doc.alarmType,
+    alarmCodes: doc.alarmCodes,
+    alarmText: doc.alarmText,
+    alarmTextAr: doc.alarmTextAr,
+    packet_date: packetDate,
+    date: serverDate,
+    latitude,
+    longitude,
+    speed,
+    course: direction,
+    direction,
+    ignition: typeof attrs?.ignition === "boolean" ? attrs.ignition : null,
+    distanceDiff,
+    traccar_position_id: doc.traccar_position_id,
+    gps: hasValidCoords
+      ? {
+          latitude,
+          longitude,
+          speed: speedRounded,
+          direction,
+        }
+      : undefined,
+  };
   enqueuePersistForImei(imei, {
     imei,
-    position,
-    doc,
-    subscriberLegacyDoc,
-    attrs,
+    doc: persistenceDoc,
+    attrs: persistenceAttrs,
     latitude,
     longitude,
     speed,
@@ -2617,8 +2579,6 @@ async function persistPositionHeavy(ctx) {
     alarmCodesForAcc,
   } = ctx;
 
-  gpsLogsWriter.writeOneFireAndForget(doc);
-
   // رصد خمول فوري (محرك يعمل + سرعة صفر/منخفضة مدة ≥ 5 دق) — إشعار مرة واحدة حتى الحركة
   setImmediate(() => {
     handleIdleNotifySample(
@@ -2636,20 +2596,6 @@ async function persistPositionHeavy(ctx) {
         requireAccOn: true,
         onIdleConfirmed: async ({ imei: im, idleStart, packetDate: pd, lat, lon }) => {
           try {
-            gpsLogsWriter.writeOneFireAndForget({
-              imei: im,
-              type: "alarm",
-              subType: "idle",
-              alarmType: "IDLE",
-              alarmText: `Vehicle idle since ${idleStart?.toISOString?.() || ""}`,
-              alarmTextAr:
-                "المركبة في حالة خمول: المحرك يعمل والسرعة منخفضة/صفر لمدة لا تقل عن 5 دقائق",
-              packet_date: pd,
-              date: pd,
-              latitude: lat ?? undefined,
-              longitude: lon ?? undefined,
-              idle_start: idleStart,
-            });
             if (isHistorical) return;
             await SEND_NOTIFY_TO_CLIENT(im, `خمول ${im}`, "المركبة في حالة خمول (محرك يعمل وسرعة صفر/منخفضة)", {
               type: "alarm",
@@ -2663,7 +2609,7 @@ async function persistPositionHeavy(ctx) {
               idle_start: idleStart?.toISOString?.() || "",
             });
           } catch (e) {
-            console.error("Idle GpsLog/notify error:", e.message);
+            console.error("Idle notify error:", e.message);
           }
         },
       }

@@ -182,11 +182,9 @@ describe("device status pipeline", () => {
 });
 
 describe("health snapshot names", () => {
-  it("exposes gpslogs_write_enabled and persistence_dropped separately from live coalescing", () => {
+  it("exposes persistence_dropped separately from live coalescing", () => {
     const metrics = createBridgeMetrics();
-    metrics.gpslogs_write_enabled = false;
     const snap = snapshotMetrics(metrics);
-    assert.equal(snap.gpslogs_write_enabled, false);
     assert.equal(snap.persistence_dropped, 0);
     assert.equal("live_coalesced" in snap, true);
     assert.equal("coalesced_dropped" in snap, false);

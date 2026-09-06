@@ -41,7 +41,7 @@ function plainGpsDoc(doc) {
 }
 
 /**
- * Mirror one gps_logs alarm row into notifications (same fields as GpsLog).
+ * Mirror one alarm payload into notifications.
  */
 async function mirrorGpsAlarmToNotification(doc) {
   const plain = plainGpsDoc(doc);
@@ -107,7 +107,7 @@ async function mirrorGpsAlarmToNotification(doc) {
 }
 
 /**
- * Persist notification (commands / non-gpslog paths). FCM is optional — handled by caller.
+ * Persist notification. FCM is optional and handled by caller.
  */
 async function persistTenantNotification({
   imei,
