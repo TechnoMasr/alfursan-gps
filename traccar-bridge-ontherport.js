@@ -947,10 +947,14 @@ function startSubscribersServer() {
       traccar_model_sync_failed_total: bridgeMetrics.traccar_model_sync_failed_total || 0,
       traccar_model_sync_skipped_no_model_total: bridgeMetrics.traccar_model_sync_skipped_no_model_total || 0,
       traccar_model_sync_already_correct_total: bridgeMetrics.traccar_model_sync_already_correct_total || 0,
+      traccar_model_sync_attempt_total: bridgeMetrics.traccar_model_sync_attempt_total || 0,
+      traccar_model_sync_verified_total: bridgeMetrics.traccar_model_sync_verified_total || 0,
+      traccar_model_sync_mismatch_total: bridgeMetrics.traccar_model_sync_mismatch_total || 0,
       traccar_model_sync_pending: bridgeMetrics.traccar_model_sync_pending || 0,
       traccar_model_sync_queue_depth: bridgeMetrics.traccar_model_sync_queue_depth || 0,
       traccar_model_cache_size: bridgeMetrics.traccar_model_cache_size || 0,
       traccar_model_sync_last_success_at: bridgeMetrics.traccar_model_sync_last_success_at || null,
+      traccar_power_seen_total: bridgeMetrics.traccar_power_seen_total || 0,
       persistence_health: persistenceHealth,
       gpspoint_spool_dir: writerStats.gpspoint_spool_dir,
       ts: new Date().toISOString(),
@@ -2312,6 +2316,9 @@ function processGpsBurst(imei, positions, rawPayload) {
 
 function persistPositionBody(imei, position, rawPayload, options = {}) {
   const rawAttrs = position?.attributes || {};
+  if (Object.prototype.hasOwnProperty.call(rawAttrs, "power")) {
+    bridgeMetrics.traccar_power_seen_total = (bridgeMetrics.traccar_power_seen_total || 0) + 1;
+  }
   const attrs = mergeStickyAttributesForImei(imei, rawAttrs);
   if (positionHasCommandResponse(position)) {
     persistCommandResponseFast(imei, position, String(attrs.result).trim());
