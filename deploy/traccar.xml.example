@@ -1,0 +1,28 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE properties SYSTEM 'http://java.sun.com/dtd/properties.dtd'>
+<properties>
+
+  <entry key='database.memory'>true</entry>
+  <entry key='database.registerUnknown'>true</entry>
+
+  <entry key='web.address'>127.0.0.1</entry>
+  <entry key='web.port'>8082</entry>
+  <entry key='web.serviceAccountToken'>replace-with-random-service-token</entry>
+
+  <entry key='forward.type'>json</entry>
+  <entry key='forward.url'>http://127.0.0.1:3053/traccar/position</entry>
+  <entry key='forward.header'>Authorization: Bearer replace-with-random-forward-token</entry>
+  <entry key='forward.retry.enable'>true</entry>
+  <entry key='forward.retry.delay'>100</entry>
+  <entry key='forward.retry.count'>10</entry>
+  <entry key='forward.retry.limit'>10000</entry>
+
+  <entry key='server.buffering.threshold'>0</entry>
+  <entry key='filter.enable'>false</entry>
+  <entry key='geocoder.enable'>false</entry>
+  <entry key='geolocation.enable'>false</entry>
+  <entry key='speedLimit.enable'>false</entry>
+  <entry key='server.statistics'></entry>
+  <entry key='logger.level'>warning</entry>
+
+</properties>
