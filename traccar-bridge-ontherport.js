@@ -1156,29 +1156,19 @@ function startSubscribersServer() {
     res.json({ ok: true, arr:arr, ts: new Date().toISOString() });
   });
 
-  // Trigger Traccar WS reconnect after a delay (used by Laravel after creating device)
-  app.post("/traccar/reconnect", (req, res) => {
-    scheduleReconnect("external_request", 2 * 60 * 1000);
-    res.json({
-      ok: true,
-      scheduled_at: traccarReconnect.snapshot().scheduled_at
-        ? new Date(traccarReconnect.snapshot().scheduled_at).toISOString()
-        : null,
-    });
-  });
-
   /**
-   * Laravel / داخلي: ضبط المسافة المجمّعة وساعات المحرك في Traccar (مثل إعدادات Accumulators في الواجهة).
+   * Laravel / داخلي: ضبط المسافة المجمّعة وساعات المحرك في AlFursan Mongo state.
    * JSON: { "deviceId": 189, "hours": 0, "totalDistance": 0 } — أو imei بدل deviceId
    * totalDistance بالمتر؛ أو أرسل totalDistanceKm وسيُحوَّل للمتر إن لم يُرسل totalDistance.
    */
   app.post("/traccar/accumulators", async (req, res) => {
     try {
-      if (!traccarHttpClient) {
-        return res.status(503).json({ ok: false, error: "traccar_session_not_ready" });
-      }
       const body = req.body || {};
-      const { imei, deviceId, hours } = body;
+      const { imei, hours } = body;
+      const payloadImei = imei ? String(imei).trim() : null;
+      if (!payloadImei) {
+        return res.status(400).json({ ok: false, error: "imei_required" });
+      }
 
       let totalDistanceM = Number(body.totalDistance);
       if (!Number.isFinite(totalDistanceM) && body.totalDistanceKm != null) {
@@ -1195,27 +1185,32 @@ function startSubscribersServer() {
         });
       }
 
-      let targetDeviceId = Number(deviceId);
-      if (!Number.isFinite(targetDeviceId) && imei) {
-        targetDeviceId = await resolveDeviceIdByImei(String(imei).trim());
-      }
+      const km = totalDistanceM / 1000;
+      await mongoose.connection.collection("devicestatuses").updateOne(
+        { imei: payloadImei },
+        {
+          $set: {
+            imei: payloadImei,
+            engine_hours: h,
+            hours: h,
+            total_distance_m: totalDistanceM,
+            device_total_distance: totalDistanceM,
+            km_total: km,
+            miles_total: km * 0.621371,
+            accumulators_updated_at: new Date(),
+            updatedAt: new Date(),
+          },
+          $setOnInsert: { createdAt: new Date() },
+        },
+        { upsert: true }
+      );
 
-      if (!Number.isFinite(targetDeviceId)) {
-        return res.status(404).json({ ok: false, error: "device_not_found" });
-      }
-
-      await putTraccarDeviceAccumulators(targetDeviceId, {
-        hours,
-        totalDistance: totalDistanceM,
-      });
-
-      console.log("[traccar] accumulators updated", { deviceId: targetDeviceId, hours, totalDistanceM });
-      return res.json({ ok: true, deviceId: targetDeviceId, hours, totalDistance: totalDistanceM });
+      console.log("[alfursan] accumulators updated", { imei: payloadImei, hours: h, totalDistanceM });
+      return res.json({ ok: true, imei: payloadImei, hours: h, totalDistance: totalDistanceM });
     } catch (err) {
-      const status = err?.response?.status;
       const msg = err?.response?.data?.message || err?.response?.data || err.message || "accumulators_failed";
-      console.error("[traccar] accumulators error:", status, msg);
-      const code = typeof status === "number" && status >= 400 && status < 600 ? status : 500;
+      console.error("[alfursan] accumulators error:", msg);
+      const code = Number(err?.statusCode) || 500;
       return res.status(code).json({ ok: false, error: typeof msg === "string" ? msg : String(msg) });
     }
   });
@@ -1229,28 +1224,21 @@ function startSubscribersServer() {
       const enTitle = body.enTitle ?? body.cmdEnTitle;
       const arBody = body.arBody ?? body.cmdArBody;
       const enBody = body.enBody ?? body.cmdEnBody;
-      const { imei, command, commandId, deviceId } = body;
+      const { imei, command, commandId } = body;
       const payloadCommand = String(command || "").trim();
       const payloadImei = imei ? String(imei).trim() : null;
 
       if (!payloadCommand) {
         return res.status(400).send("âŒ command is required");
       }
+      if (!payloadImei) {
+        return res.status(400).send("âŒ imei is required");
+      }
       if (!traccarHttpClient) {
-        return res.status(503).send("âŒ Traccar session is not ready");
+        return res.status(503).send("âŒ Traccar REST client is not ready");
       }
 
-      let targetDeviceId = Number(deviceId);
-      if (!Number.isFinite(targetDeviceId) && payloadImei) {
-        targetDeviceId = await resolveDeviceIdByImei(payloadImei);
-      }
-      if (!Number.isFinite(targetDeviceId)) {
-        return res.status(404).send("âŒ device mapping not found");
-      }
-
-      if (payloadImei) {
-        deviceIdToImeiCache.set(targetDeviceId, payloadImei);
-      }
+      const targetDeviceId = await resolveRuntimeDeviceIdByImei(payloadImei);
 
       await traccarHttpClient.post("/api/commands/send", {
         type: "custom",
@@ -1258,45 +1246,43 @@ function startSubscribersServer() {
         deviceId: targetDeviceId,
       });
 
-      if (payloadImei) {
-        // عناوين افتراضية عربي/إنجليزي إذا لم ترسلها الـ API
-        const cmdArTitle = String(arTitle || "").trim() || `تم إرسال أمر إلى الجهاز ${payloadImei}`;
-        const cmdEnTitle = String(enTitle || "").trim() || `Command sent to device ${payloadImei}`;
-        const cmdArBody = String(arBody || "").trim() || payloadCommand;
-        const cmdEnBody = String(enBody || "").trim() || payloadCommand;
+      const cmdArTitle = String(arTitle || "").trim() || `تم إرسال أمر إلى الجهاز ${payloadImei}`;
+      const cmdEnTitle = String(enTitle || "").trim() || `Command sent to device ${payloadImei}`;
+      const cmdArBody = String(arBody || "").trim() || payloadCommand;
+      const cmdEnBody = String(enBody || "").trim() || payloadCommand;
 
-        setImmediate(async () => {
-          try {
-            await CommandResponse.create({
-              imei: payloadImei,
-              command: payloadCommand,
-              commandId: commandId || null,
-              sentAt: new Date(),
-              status: "pending",
-              arTitle: cmdArTitle,
-              enTitle: cmdEnTitle,
-              arBody: cmdArBody,
-              enBody: cmdEnBody,
-            });
-            // إشعار للمستخدم (العنوان/النص العربي كما في باقي الجسر؛ الإنجليزي داخل data)
-            await SEND_NOTIFY_TO_CLIENT(payloadImei, cmdArTitle, cmdArBody, {
-              type: "command_sent",
-              imei: payloadImei,
-              command: payloadCommand,
-              enTitle: cmdEnTitle,
-              enBody: cmdEnBody,
-            });
-          } catch (err) {
-            console.error("Error saving command / notify:", err.message);
-          }
-        });
-      }
+      setImmediate(async () => {
+        try {
+          await CommandResponse.create({
+            imei: payloadImei,
+            command: payloadCommand,
+            commandId: commandId || null,
+            sentAt: new Date(),
+            status: "pending",
+            arTitle: cmdArTitle,
+            enTitle: cmdEnTitle,
+            arBody: cmdArBody,
+            enBody: cmdEnBody,
+            traccar_runtime_device_id: targetDeviceId,
+          });
+          await SEND_NOTIFY_TO_CLIENT(payloadImei, cmdArTitle, cmdArBody, {
+            type: "command_sent",
+            imei: payloadImei,
+            command: payloadCommand,
+            enTitle: cmdEnTitle,
+            enBody: cmdEnBody,
+          });
+        } catch (err) {
+          console.error("Error saving command / notify:", err.message);
+        }
+      });
 
       return res.send("✅ تم إرسال الأمر للجهاز عبر Traccar");
     } catch (err) {
       const message = err?.response?.data?.message || err.message || "command_send_failed";
       console.error("Command send error:", message);
-      return res.status(500).send(`âŒ ${message}`);
+      const statusCode = Number(err?.statusCode || err?.response?.status) || 500;
+      return res.status(statusCode).send(`âŒ ${message}`);
     }
   });
 
@@ -1653,42 +1639,6 @@ function buildAlarmMessageFromCodes(codes) {
   };
 }
 
-function getDeviceMapCollection() {
-  return mongoose.connection.collection("devicemapids");
-}
-
-async function upsertDeviceMap(mysqlId, imei, source = "unknown") {
-  const id = Number(mysqlId);
-  const normImei = String(imei || "").trim();
-  if (!Number.isFinite(id) || !normImei) {
-    console.warn("Device map update skipped (invalid)", { mysqlId, imei, source });
-    return;
-  }
-  try {
-    await getDeviceMapCollection().updateOne(
-      { mysql_id: id },
-      {
-        $set: { imei: normImei, updated_at: new Date(), source },
-        $setOnInsert: { created_at: new Date() },
-      },
-      { upsert: true }
-    );
-    deviceIdToImeiCache.set(id, normImei);
-  } catch (err) {
-    console.warn("Device map update failed", { mysqlId, imei, source, error: err.message });
-  }
-}
-
-async function updateDeviceCacheFromTraccarDevice(traccarDevice, source = "traccar_devices") {
-  const imei = warmImeiCacheFromTraccarDevice(traccarDevice);
-  if (!imei) {
-    console.warn("Traccar device missing id/uniqueId", { source, id: traccarDevice?.id, uniqueId: traccarDevice?.uniqueId });
-    return null;
-  }
-  await upsertDeviceMap(Number(traccarDevice.id), imei, source);
-  return imei;
-}
-
 async function fetchTraccarDeviceById(deviceId, reason = "missing_map") {
   if (!traccarHttpClient) {
     console.warn("Traccar client not ready for device fetch", { deviceId, reason });
@@ -1700,9 +1650,8 @@ async function fetchTraccarDeviceById(deviceId, reason = "missing_map") {
       console.warn("Traccar device fetch returned empty", { deviceId, reason });
       return null;
     }
-    const imei = await updateDeviceCacheFromTraccarDevice(data, "traccar_device_by_id");
+    const imei = warmImeiCacheFromTraccarDevice(data);
     if (imei) {
-      void persistTraccarDeviceStatus(data).catch(() => {});
       console.warn("Resolved device by id via Traccar", { deviceId, imei, reason });
       return imei;
     }
@@ -1713,56 +1662,6 @@ async function fetchTraccarDeviceById(deviceId, reason = "missing_map") {
 }
 fetchTraccarDeviceByIdImpl = fetchTraccarDeviceById;
 
-async function fetchTraccarDevicesList(reason = "interval") {
-  if (!traccarHttpClient) {
-    console.warn("Traccar client not ready for devices list", { reason });
-    return;
-  }
-  if (!devicesListBackoff.allowed()) {
-    console.warn("Devices list fetch skipped due to backoff", {
-      reason,
-      retry_in_ms: devicesListBackoff.retryInMs(),
-    });
-    return;
-  }
-  try {
-    const { data } = await traccarHttpClient.get("/api/devices");
-    if (!Array.isArray(data) || data.length === 0) {
-      console.warn("Traccar devices list empty", { reason });
-      devicesListBackoff.onFailure();
-      return;
-    }
-    for (const dev of data) warmImeiCacheFromTraccarDevice(dev);
-    for (const dev of data) {
-      void updateDeviceCacheFromTraccarDevice(dev, "traccar_devices_list").catch((e) =>
-        console.warn("Device map sync failed", { id: dev?.id, error: e.message })
-      );
-      void persistTraccarDeviceStatus(dev).catch((e) =>
-        console.warn("Device status persist failed", { id: dev?.id, error: e.message })
-      );
-    }
-    devicesListBackoff.onSuccess();
-    console.warn("Traccar devices list synced", { reason, count: data.length });
-  } catch (err) {
-    console.warn("Traccar devices list fetch failed", { reason, error: err.message });
-    devicesListBackoff.onFailure();
-  }
-}
-
-function startDevicesPolling() {
-  if (devicesPollingStarted) return;
-  devicesPollingStarted = true;
-  // initial fire-and-forget
-  fetchTraccarDevicesList("startup").catch((e) =>
-    console.warn("Initial devices list sync failed", { error: e.message })
-  );
-  devicesPollTimer = setInterval(() => {
-    fetchTraccarDevicesList("interval").catch((e) =>
-      console.warn("Devices list sync failed", { error: e.message })
-    );
-  }, DEVICES_POLL_MS);
-}
-
 async function resolveImei(deviceId) {
   const key = Number(deviceId);
   if (!Number.isFinite(key)) return null;
@@ -1770,56 +1669,41 @@ async function resolveImei(deviceId) {
   const cached = deviceIdToImeiCache.get(key);
   if (cached) return cached;
 
-  const mapDoc = await getDeviceMapCollection().findOne({ mysql_id: key });
-  const mappedImei = mapDoc?.imei || mapDoc?.imie || null;
-  if (mappedImei) {
-    deviceIdToImeiCache.set(key, String(mappedImei));
-    return String(mappedImei);
-  }
-
-  // fallback: one in-flight GET /api/devices/{id}; waiters share the same promise
+  // Runtime-only fallback for forwarded packets that omitted uniqueId.
+  // This is cached in RAM and is never persisted as an authoritative mapping.
   const fetched = await deviceResolver.resolve(key, "resolve_imei");
   if (fetched) return fetched;
 
   return null;
 }
 
-async function resolveDeviceIdByImei(imei) {
+async function resolveRuntimeDeviceIdByImei(imei) {
   const normalized = String(imei || "").trim();
-  if (!normalized) return null;
+  if (!normalized) throw new Error("imei_required");
+  if (!traccarHttpClient) throw new Error("traccar_client_not_ready");
 
-  const mapDoc = await getDeviceMapCollection().findOne({
-    $or: [{ imei: normalized }, { imie: normalized }],
+  const { data } = await traccarHttpClient.get("/api/devices", {
+    params: { uniqueId: normalized },
   });
-  const mysqlId = Number(mapDoc?.mysql_id);
-  if (!Number.isFinite(mysqlId)) return null;
-
-  deviceIdToImeiCache.set(mysqlId, normalized);
-  return mysqlId;
-}
-
-/**
- * Traccar REST: PUT /api/devices/{id}/accumulators
- * Body مثل الواجهة: { deviceId, hours, totalDistance } — totalDistance بالمتر.
- */
-async function putTraccarDeviceAccumulators(deviceId, { hours, totalDistance }) {
-  if (!traccarHttpClient) {
-    throw new Error("traccar_client_not_ready");
+  const list = Array.isArray(data) ? data : data ? [data] : [];
+  const matches = list.filter((dev) => String(dev?.uniqueId || "").trim() === normalized);
+  if (matches.length !== 1) {
+    const err = new Error(
+      matches.length === 0
+        ? "device_not_registered_in_traccar_runtime"
+        : "multiple_runtime_devices_for_imei"
+    );
+    err.statusCode = matches.length === 0 ? 404 : 409;
+    throw err;
   }
-  const id = Number(deviceId);
-  if (!Number.isFinite(id)) {
-    throw new Error("invalid_device_id");
+  const runtimeId = Number(matches[0].id);
+  if (!Number.isFinite(runtimeId)) {
+    const err = new Error("invalid_runtime_device_id");
+    err.statusCode = 502;
+    throw err;
   }
-  const h = Number(hours);
-  const d = Number(totalDistance);
-  if (!Number.isFinite(h) || !Number.isFinite(d)) {
-    throw new Error("invalid_hours_or_totalDistance");
-  }
-  await traccarHttpClient.put(`/api/devices/${id}/accumulators`, {
-    deviceId: id,
-    hours: h,
-    totalDistance: d,
-  });
+  deviceIdToImeiCache.set(runtimeId, normalized);
+  return runtimeId;
 }
 
 async function ensureState(imei) {
