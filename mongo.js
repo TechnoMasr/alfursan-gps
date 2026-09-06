@@ -63,14 +63,58 @@ traccarIngressRawSchema.set("collection", "traccar_ingress_raw");
 
 async function ensureTraccarRawIngressRetentionIndex() {
   const days = Number(process.env.TRACCAR_RAW_RETENTION_DAYS ?? 7);
+  const collectionName = "traccar_ingress_raw";
   const coll = mongoose.connection.collection("traccar_ingress_raw");
   const indexName = "traccar_raw_received_at_ttl";
+  const isMissingNamespace = (err) => err?.codeName === "NamespaceNotFound" || err?.code === 26 || /ns does not exist/i.test(String(err?.message || ""));
+
+  async function safeIndexes() {
+    try {
+      return await coll.indexes();
+    } catch (err) {
+      if (!isMissingNamespace(err)) throw err;
+      await mongoose.connection.db.createCollection(collectionName);
+      return coll.indexes();
+    }
+  }
+
+  async function updateExistingReceivedAtIndex(existing, expireAfterSeconds) {
+    try {
+      await mongoose.connection.db.command({
+        collMod: collectionName,
+        index: {
+          name: existing.name,
+          expireAfterSeconds,
+        },
+      });
+      console.log(`[mongo] updated ${collectionName}.${existing.name} TTL to ${expireAfterSeconds}s`);
+      return true;
+    } catch (err) {
+      console.warn(
+        `[mongo] existing ${collectionName}.${existing.name} index is not TTL-compatible; keeping it unchanged: ${err.message}`
+      );
+      return false;
+    }
+  }
+
   if (Number.isFinite(days) && days > 0) {
     const expireAfterSeconds = Math.floor(days * 24 * 60 * 60);
-    const indexes = await coll.indexes();
+    const indexes = await safeIndexes();
     const existing = indexes.find((index) => index.name === indexName);
     if (existing && Number(existing.expireAfterSeconds) !== expireAfterSeconds) {
       await coll.dropIndex(indexName);
+    }
+    const sameReceivedAtKey = indexes.find(
+      (index) =>
+        index.name !== indexName &&
+        index.key &&
+        Object.keys(index.key).length === 1 &&
+        Number(index.key.received_at) === 1
+    );
+    if (sameReceivedAtKey) {
+      if (Number(sameReceivedAtKey.expireAfterSeconds) === expireAfterSeconds) return;
+      await updateExistingReceivedAtIndex(sameReceivedAtKey, expireAfterSeconds);
+      return;
     }
     await coll.createIndex(
       { received_at: 1 },
@@ -85,7 +129,7 @@ async function ensureTraccarRawIngressRetentionIndex() {
   try {
     await coll.dropIndex(indexName);
   } catch (err) {
-    if (err?.codeName !== "IndexNotFound" && err?.code !== 27) throw err;
+    if (err?.codeName !== "IndexNotFound" && err?.code !== 27 && !isMissingNamespace(err)) throw err;
   }
 }
 
