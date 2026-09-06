@@ -78,6 +78,40 @@ setGpsPointWriter(gpsPointWriter);
 
 const tripState = new Map();
 
+const WORKER_METRIC_KEYS = [
+  "gpspoints_queue_depth",
+  "gpspoints_received_total",
+  "gpspoints_batch_completed",
+  "gpspoints_persisted_total",
+  "gpspoints_retry_total",
+  "gpspoints_spooled_total",
+  "gpspoints_spool_depth",
+  "gpspoints_spool_files",
+  "gpspoints_spool_bytes",
+  "gpspoints_spool_oldest_age_ms",
+  "gpspoints_spool_write_failures",
+  "gpspoints_mongo_attempted_total",
+  "gpspoints_mongo_acknowledged_total",
+  "gpspoints_duplicate_already_persisted_total",
+  "gpspoints_unexpected_duplicate_total",
+  "gpspoints_persist_failures",
+  "gpspoints_duplicates_ignored",
+  "gpspoints_health",
+  "gpspoint_spool_dir",
+  "disk_free_bytes",
+  "persistence_dropped",
+];
+
+function publishWorkerMetrics() {
+  if (!process.send) return;
+  const stats = { ...gpsPointWriter.getStats(), ...bridgeMetrics };
+  for (const key of WORKER_METRIC_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(stats, key)) {
+      process.send({ type: "worker_metric", key, value: stats[key] });
+    }
+  }
+}
+
 function minutesDiff(a, b) {
   const ta = a instanceof Date ? a.getTime() : new Date(a).getTime();
   const tb = b instanceof Date ? b.getTime() : new Date(b).getTime();
@@ -441,6 +475,7 @@ async function processBatch(batch) {
   if (typeof gpsPointWriter.flushCycle === "function") {
     await gpsPointWriter.flushCycle({ force: true }).catch(() => {});
   }
+  publishWorkerMetrics();
 }
 
 process.on("message", async (msg) => {
@@ -459,5 +494,8 @@ process.on("message", async (msg) => {
 startIdleStatsScheduler();
 startTravelStatsScheduler();
 startStaticStatsScheduler();
+
+const workerMetricsTimer = setInterval(publishWorkerMetrics, 5000);
+if (typeof workerMetricsTimer.unref === "function") workerMetricsTimer.unref();
 
 if (process.send) process.send({ type: "ready" });

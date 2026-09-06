@@ -9,8 +9,8 @@ const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const Trip = require("./trip");
-const { GpsLog, GpsPoint, GpsBuffer, CommandResponse, Notification } = require("./mongo");
-const { enqueueGpsPoint, backfillGpsPointsFromLogs, setGpsPointWriter } = require("./gpsPointStore");
+const { GpsLog, GpsPoint, GpsBuffer, CommandResponse, Notification, TraccarIngressRaw } = require("./mongo");
+const { enqueueGpsPoint, backfillGpsPointsFromLogs } = require("./gpsPointStore");
 const { upsertDeviceStatus } = require("./deviceStatus");
 const { loadBridgeEnv } = require("./lib/bridgeEnv");
 const {
@@ -21,7 +21,6 @@ const {
   recordLiveClockSplit,
 } = require("./lib/liveEligibility");
 const { createBridgeMetrics, recordLiveDecision, snapshotMetrics } = require("./lib/bridgeMetrics");
-const { createGpsPointWriter } = require("./lib/gpsPointWriter");
 const { configureGpsLogsWriter } = require("./lib/gpsLogsWriter");
 const { createAnalyticsQueue } = require("./lib/analyticsQueue");
 const { createPersistenceIpc } = require("./lib/persistenceIpc");
@@ -29,6 +28,10 @@ const { createWsDelivery } = require("./lib/wsDelivery");
 const { attachSubscriberHeartbeat } = require("./lib/subscriberHeartbeat");
 const { createDeviceResolver } = require("./lib/deviceResolve");
 const { createTraccarForwardQueue } = require("./lib/traccarForwardQueue");
+const {
+  createTraccarRawIngressWriter,
+  buildTraccarRawIngressDoc,
+} = require("./lib/traccarRawIngressWriter");
 const { resolveRuntimeDeviceIdByImei: resolveRuntimeDeviceIdByImeiViaTraccar } = require("./lib/traccarRuntimeDevices");
 const { maybeLatencyLog } = require("./lib/latencyLog");
 const { createEventLoopLagMonitor } = require("./lib/eventLoopLag");
@@ -108,6 +111,15 @@ let subscribersWss = null;
 const liveFixTracker = createLiveFixTracker();
 const bridgeMetrics = createBridgeMetrics();
 bridgeMetrics.gpslogs_write_enabled = GPSLOGS_WRITE_ENABLED;
+const rawIngressWriter = createTraccarRawIngressWriter({
+  insertMany: (docs) => TraccarIngressRaw.insertMany(docs, { ordered: true }),
+  spoolDir: path.join(__dirname, "data", "traccar-raw-ingress-spool"),
+  batchSize: 250,
+  flushMs: 100,
+  maxQueueDepth: Math.max(1000, BRIDGE_ENV.TRACCAR_FORWARD_QUEUE_MAX || 5000),
+  metrics: bridgeMetrics,
+  log: console,
+});
 /** Per-IMEI broadcast ordering guard (tenant room + subscribers). */
 const lastBroadcastPacketMsByImei = new Map();
 const gpsLogsWriter = {
@@ -822,6 +834,16 @@ function startSubscribersServer() {
   subscribersServerStarted = true;
 
   const app = express();
+  app.use((req, res, next) => {
+    if (req.path !== "/traccar/position") return next();
+    const auth = verifyForwardBearer(req.headers.authorization, TRACCAR_FORWARD_TOKEN);
+    if (!auth.ok) {
+      bridgeMetrics.forward_unauthorized_total = (bridgeMetrics.forward_unauthorized_total || 0) + 1;
+      const status = auth.reason === "forward_token_not_configured" ? 503 : 401;
+      return res.status(status).json({ ok: false, error: auth.reason });
+    }
+    return next();
+  });
   app.use(express.json());
   app.use((err, req, res, next) => {
     if (err instanceof SyntaxError && req?.path === "/traccar/position") {
@@ -841,9 +863,18 @@ function startSubscribersServer() {
     Object.assign(bridgeMetrics, counts);
     bridgeMetrics.traccar_ingress = "http-forward";
     bridgeMetrics.forward_queue_depth = forwardQueue.getDepth();
+    Object.assign(bridgeMetrics, rawIngressWriter.getStats());
     bridgeMetrics.gpslogs_write_enabled = GPSLOGS_WRITE_ENABLED;
-    const writerStats = gpsPointWriter.getStats();
-    Object.assign(bridgeMetrics, writerStats);
+    const localWriterStats = gpsPointWriter.getStats();
+    const writerStats = {
+      ...localWriterStats,
+      gpspoint_spool_dir:
+        bridgeMetrics.gpspoint_spool_dir || localWriterStats.gpspoint_spool_dir,
+      gpspoints_health:
+        bridgeMetrics.gpspoints_health || localWriterStats.gpspoints_health || "ok",
+      disk_free_bytes:
+        bridgeMetrics.disk_free_bytes ?? localWriterStats.disk_free_bytes ?? null,
+    };
     const lag = eventLoopLag.snapshot();
     Object.assign(bridgeMetrics, lag);
     const persistenceHealth = writerStats.gpspoints_health || "ok";
@@ -859,6 +890,17 @@ function startSubscribersServer() {
       traccar_forward_queue_depth: forwardQueue.getDepth(),
       traccar_forward_queue_rejected_total: bridgeMetrics.forward_queue_rejected_total || 0,
       traccar_command_responses_total: bridgeMetrics.forward_command_responses_total || 0,
+      raw_ingress_received_total: bridgeMetrics.raw_ingress_received_total || 0,
+      raw_ingress_accepted_total: bridgeMetrics.raw_ingress_accepted_total || 0,
+      raw_ingress_persisted_total: bridgeMetrics.raw_ingress_persisted_total || 0,
+      raw_ingress_mongo_attempted_total: bridgeMetrics.raw_ingress_mongo_attempted_total || 0,
+      raw_ingress_persist_failures: bridgeMetrics.raw_ingress_persist_failures || 0,
+      raw_ingress_queue_depth: bridgeMetrics.raw_ingress_queue_depth || 0,
+      raw_ingress_queue_rejected_total: bridgeMetrics.raw_ingress_queue_rejected_total || 0,
+      raw_ingress_spooled_total: bridgeMetrics.raw_ingress_spooled_total || 0,
+      raw_ingress_spool_depth: bridgeMetrics.raw_ingress_spool_depth || 0,
+      raw_ingress_last_received_at: bridgeMetrics.raw_ingress_last_received_at || null,
+      raw_ingress_last_persisted_at: bridgeMetrics.raw_ingress_last_persisted_at || null,
       gpslogs_write_enabled: GPSLOGS_WRITE_ENABLED,
       persistence_health: persistenceHealth,
       gpspoint_spool_dir: writerStats.gpspoint_spool_dir,
@@ -902,24 +944,29 @@ function startSubscribersServer() {
       bridgeMetrics.forward_invalid_total = (bridgeMetrics.forward_invalid_total || 0) + 1;
       return res.status(415).json({ ok: false, error: "json_required" });
     }
-    const auth = verifyForwardBearer(req.headers.authorization, TRACCAR_FORWARD_TOKEN);
-    if (!auth.ok) {
-      bridgeMetrics.forward_unauthorized_total = (bridgeMetrics.forward_unauthorized_total || 0) + 1;
-      const status = auth.reason === "forward_token_not_configured" ? 503 : 401;
-      return res.status(status).json({ ok: false, error: auth.reason });
+
+    const receivedAt = Date.now();
+    bridgeMetrics.raw_ingress_received_total = (bridgeMetrics.raw_ingress_received_total || 0) + 1;
+    bridgeMetrics.raw_ingress_last_received_at = new Date(receivedAt).toISOString();
+    const rawQueued = rawIngressWriter.enqueue(buildTraccarRawIngressDoc(req.body, receivedAt));
+    if (!rawQueued.accepted) {
+      return res.status(503).json({ ok: false, error: rawQueued.reason });
     }
+
     const normalized = normalizeForwardPayload(req.body);
     if (!normalized.ok) {
       bridgeMetrics.forward_invalid_total =
         (bridgeMetrics.forward_invalid_total || 0) + Math.max(1, normalized.invalid.length);
-      return res.status(400).json({
-        ok: false,
+      return res.status(202).json({
+        ok: true,
+        ingress: "http-forward",
+        raw_accepted: true,
+        accepted: 0,
         error: "invalid_forward_position",
         invalid: normalized.invalid.slice(0, 5),
       });
     }
 
-    const receivedAt = Date.now();
     bridgeMetrics.forward_last_received_at = new Date(receivedAt).toISOString();
     bumpForwardPositionsReceived(normalized.items.length);
     bridgeMetrics.forward_invalid_total =
@@ -2838,6 +2885,7 @@ async function gracefulShutdown(signal) {
   try {
     await Promise.race([
       Promise.all([
+        rawIngressWriter.flushAndStop(BRIDGE_ENV.BRIDGE_SHUTDOWN_TIMEOUT_MS),
         forwardQueue.flushAndStop(BRIDGE_ENV.BRIDGE_SHUTDOWN_TIMEOUT_MS),
         gpsPointWriter.flushAndStop(BRIDGE_ENV.BRIDGE_SHUTDOWN_TIMEOUT_MS),
         persistenceIpc.flushAndStop(BRIDGE_ENV.BRIDGE_SHUTDOWN_TIMEOUT_MS),

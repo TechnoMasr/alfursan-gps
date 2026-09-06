@@ -7,7 +7,10 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 const uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/admin';
 
 mongoose.connect(uri)
-  .then(() => console.log('✅ Connected to MongoDB'))
+  .then(async () => {
+    console.log('✅ Connected to MongoDB');
+    await ensureTraccarRawIngressRetentionIndex();
+  })
   .catch(err => console.error('❌ MongoDB connection error:', err.message));
 
 /**
@@ -52,6 +55,57 @@ const gpsPointSchema = new mongoose.Schema(
 gpsPointSchema.index({ imei: 1, packet_date: 1 });
 gpsPointSchema.index({ imei: 1, packet_date: -1 });
 gpsPointSchema.set("collection", "gpspoints");
+
+const traccarIngressRawSchema = new mongoose.Schema(
+  {
+    received_at: { type: Date, required: true, index: true },
+    source: { type: String, default: "traccar_http_forward", index: true },
+    imei: { type: String, default: null, index: true },
+    runtime_device_id: { type: Number, default: null },
+    protocol: { type: String, default: null },
+    position_id: { type: mongoose.Schema.Types.Mixed, default: null },
+    fix_time: { type: mongoose.Schema.Types.Mixed, default: null },
+    device_time: { type: mongoose.Schema.Types.Mixed, default: null },
+    server_time: { type: mongoose.Schema.Types.Mixed, default: null },
+    latitude: { type: Number, default: null },
+    longitude: { type: Number, default: null },
+    has_command_response: { type: Boolean, default: false },
+    raw_payload: { type: mongoose.Schema.Types.Mixed, required: true },
+  },
+  {
+    strict: true,
+    timestamps: true,
+  }
+);
+traccarIngressRawSchema.set("collection", "traccar_ingress_raw");
+
+async function ensureTraccarRawIngressRetentionIndex() {
+  const days = Number(process.env.TRACCAR_RAW_RETENTION_DAYS ?? 7);
+  const coll = mongoose.connection.collection("traccar_ingress_raw");
+  const indexName = "traccar_raw_received_at_ttl";
+  if (Number.isFinite(days) && days > 0) {
+    const expireAfterSeconds = Math.floor(days * 24 * 60 * 60);
+    const indexes = await coll.indexes();
+    const existing = indexes.find((index) => index.name === indexName);
+    if (existing && Number(existing.expireAfterSeconds) !== expireAfterSeconds) {
+      await coll.dropIndex(indexName);
+    }
+    await coll.createIndex(
+      { received_at: 1 },
+      {
+        name: indexName,
+        expireAfterSeconds,
+        background: true,
+      }
+    );
+    return;
+  }
+  try {
+    await coll.dropIndex(indexName);
+  } catch (err) {
+    if (err?.codeName !== "IndexNotFound" && err?.code !== 27) throw err;
+  }
+}
 
 /** Every gps_logs row with type=alarm is mirrored to notifications. */
 gpsLogSchema.post("save", function (doc) {
@@ -321,6 +375,7 @@ gpsBufferSchema.index({ imei: 1, date: -1 });
 const GpsLog = mongoose.model('GpsLog', gpsLogSchema);
 const GpsLog2 = mongoose.model('GpsLog', gpsLogSchema);
 const GpsPoint = mongoose.model('GpsPoint', gpsPointSchema);
+const TraccarIngressRaw = mongoose.model('TraccarIngressRaw', traccarIngressRawSchema);
 const GpsBuffer = mongoose.model('GpsBuffer', gpsBufferSchema);
 const TeltonikaParser = mongoose.model('TeltonikaParser', TeltonikaParserSchema);
 const DeviceStatus = mongoose.model('DeviceStatus', deviceStatusSchema);
@@ -338,6 +393,7 @@ module.exports = {
   GpsLog,
   GpsLog2,
   GpsPoint,
+  TraccarIngressRaw,
   GpsBuffer,
   TeltonikaParser,
   DeviceStatus,
