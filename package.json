@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "node --test --test-reporter=spec test/liveEligibility.test.js test/positionPipeline.test.js test/realtimeIngress.test.js test/persistenceIpc.test.js test/persistence.test.js test/realtimeInfra.test.js test/load.test.js test/commandFastPath.test.js test/durabilityAudit.test.js test/tenantThrottleAndSpool.test.js test/traccarForwardIngress.test.js",
-    "test:syntax": "node --check traccar-bridge.js && node --check traccar-bridge-ontherport.js && node --check lib/liveEligibility.js && node --check lib/gpsPointWriter.js && node --check lib/gpsLogsWriter.js && node --check lib/positionPipeline.js && node --check lib/eventLoopLag.js && node --check lib/gpspointsIdempotencyIndex.js && node --check lib/bridgeEnv.js && node --check lib/traccarForwardIngress.js && node --check deviceStatus.js && node --check geofenceService.js && node --check accReportService.js && node --check gpsPointStore.js && node --check scripts/ensure-gpspoints-idempotency-index.js",
+    "test": "node --test --test-reporter=spec test/liveEligibility.test.js test/positionPipeline.test.js test/persistenceIpc.test.js test/persistence.test.js test/realtimeInfra.test.js test/load.test.js test/commandFastPath.test.js test/durabilityAudit.test.js test/tenantThrottleAndSpool.test.js test/traccarForwardIngress.test.js",
+    "test:syntax": "node --check traccar-bridge.js && node --check traccar-bridge-ontherport.js && node --check lib/liveEligibility.js && node --check lib/gpsPointWriter.js && node --check lib/gpsLogsWriter.js && node --check lib/positionPipeline.js && node --check lib/eventLoopLag.js && node --check lib/gpspointsIdempotencyIndex.js && node --check lib/bridgeEnv.js && node --check lib/traccarForwardIngress.js && node --check lib/traccarForwardQueue.js && node --check lib/traccarRuntimeDevices.js && node --check deviceStatus.js && node --check geofenceService.js && node --check accReportService.js && node --check gpsPointStore.js && node --check scripts/ensure-gpspoints-idempotency-index.js",
     "index:gpspoints": "node scripts/ensure-gpspoints-idempotency-index.js",
     "backfill:parking": "node backfillParkingEvents.js"
   },
@@ -14,13 +14,11 @@
   "description": "",
   "dependencies": {
     "axios": "^1.13.5",
-    "axios-cookiejar-support": "^6.0.5",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^5.1.0",
     "firebase-admin": "^13.6.0",
     "mongoose": "^8.18.3",
-    "tough-cookie": "^6.0.0",
     "ws": "^8.19.0"
   }
 }

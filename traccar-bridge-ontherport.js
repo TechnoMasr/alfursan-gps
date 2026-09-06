@@ -28,8 +28,8 @@ const { createPersistenceIpc } = require("./lib/persistenceIpc");
 const { createWsDelivery } = require("./lib/wsDelivery");
 const { attachSubscriberHeartbeat } = require("./lib/subscriberHeartbeat");
 const { createDeviceResolver } = require("./lib/deviceResolve");
-const { positionHasCommandResponse: positionHasCommandResponseLib } = require("./lib/ingressPartition");
 const { createTraccarForwardQueue } = require("./lib/traccarForwardQueue");
+const { resolveRuntimeDeviceIdByImei: resolveRuntimeDeviceIdByImeiViaTraccar } = require("./lib/traccarRuntimeDevices");
 const { maybeLatencyLog } = require("./lib/latencyLog");
 const { createEventLoopLagMonitor } = require("./lib/eventLoopLag");
 const { createImeiDebugger } = require("./lib/imeiDebug");
@@ -99,12 +99,6 @@ const socketRooms = new WeakMap();
 const COMMAND_RESPONSE_CHANNEL = "command_response_chanel";
 const DEBUG_CMD_CHANNEL =
   String(process.env.DEBUG_CMD_CHANNEL ?? "").trim() === "1";
-/**
- * When enabled (default), omit heavy truccer_dev_status from WS payloads + device status writes.
- * Set STRIP_TRUCCER_DEV_STATUS=0 to keep legacy full Traccar device blob.
- */
-const STRIP_TRUCCER_DEV_STATUS =
-  String(process.env.STRIP_TRUCCER_DEV_STATUS ?? "1") !== "0";
 const IMEI_ROOM_CACHE_TTL_MS = 10 * 60 * 1000;
 const imeiToRoomCache = new Map();
 const tenantDbNameToIdCache = new Map();
@@ -116,10 +110,6 @@ const bridgeMetrics = createBridgeMetrics();
 bridgeMetrics.gpslogs_write_enabled = GPSLOGS_WRITE_ENABLED;
 /** Per-IMEI broadcast ordering guard (tenant room + subscribers). */
 const lastBroadcastPacketMsByImei = new Map();
-const devicesListBackoff = createDevicesListBackoff({
-  baseMs: DEVICES_LIST_BACKOFF_BASE_MS,
-  maxMs: DEVICES_LIST_BACKOFF_MAX_MS,
-});
 const gpsLogsWriter = {
   writeOneFireAndForget() {},
   getStats() {
@@ -175,19 +165,6 @@ function recordBroadcastMetric() {
   }
 }
 
-function bumpTraccarPositionsReceived(n = 1) {
-  bridgeMetrics.traccar_positions_received_total =
-    (bridgeMetrics.traccar_positions_received_total || 0) + n;
-  bridgeMetrics._positions_window = (bridgeMetrics._positions_window || 0) + n;
-  const now = Date.now();
-  if (!bridgeMetrics._positions_window_ts) bridgeMetrics._positions_window_ts = now;
-  if (now - bridgeMetrics._positions_window_ts >= 1000) {
-    bridgeMetrics.traccar_positions_per_sec = bridgeMetrics._positions_window;
-    bridgeMetrics._positions_window = 0;
-    bridgeMetrics._positions_window_ts = now;
-  }
-}
-
 function bumpForwardPositionsReceived(n = 1) {
   bridgeMetrics.forward_positions_received_total =
     (bridgeMetrics.forward_positions_received_total || 0) + n;
@@ -221,7 +198,7 @@ function recordPipelineEligibility(cls) {
         (bridgeMetrics.positions_live_out_of_order || 0) + 1;
     }
   }
-  const rec = bridgeMetrics.traccar_positions_received_total || bridgeMetrics.positions_received || 0;
+  const rec = bridgeMetrics.forward_positions_received_total || bridgeMetrics.positions_received || 0;
   const elig = bridgeMetrics.live_eligible_total || 0;
   bridgeMetrics.live_eligibility_ratio = rec ? Number((elig / rec).toFixed(4)) : 0;
 }
@@ -258,8 +235,14 @@ async function warmImeiToRoomCacheFromMongo() {
       { tenant_id: { $exists: true, $ne: null } },
       { projection: { imei: 1, serial_number: 1, tenant_id: 1 } }
     );
+    const docs =
+      cursor && typeof cursor.toArray === "function"
+        ? await cursor.toArray()
+        : cursor && cursor[Symbol.asyncIterator]
+          ? cursor
+          : [];
     let count = 0;
-    for await (const doc of cursor) {
+    for await (const doc of docs) {
       const tenantId = normalizeTenantId(doc.tenant_id);
       if (!tenantId) continue;
       const roomName = buildTenantRoomName(tenantId);
@@ -331,14 +314,6 @@ function round1(value) {
   return Math.round(n * 10) / 10;
 }
 
-function normalizeIncomingPayload(msg) {
-  const text = msg?.toString?.()?.trim?.() || "";
-  if (!text) return null;
-  let parsed = JSON.parse(text);
-  if (typeof parsed === "string") parsed = JSON.parse(parsed);
-  return parsed;
-}
-
 function sendWsSafe(ws, payload, { kind = "gps", imei = null } = {}) {
   return wsDelivery.send(ws, payload, { kind, imei });
 }
@@ -369,13 +344,6 @@ function normalizeSubscriberPayload(payload) {
     if (data.legacy.gps && typeof data.legacy.gps === "object") {
       data.legacy.gps = { ...data.legacy.gps };
       if (data.legacy.gps.speed !== undefined) data.legacy.gps.speed = round1(data.legacy.gps.speed);
-    }
-  }
-
-  if (STRIP_TRUCCER_DEV_STATUS) {
-    delete data.truccer_dev_status;
-    if (data.legacy && typeof data.legacy === "object") {
-      delete data.legacy.truccer_dev_status;
     }
   }
 
@@ -912,7 +880,6 @@ function startSubscribersServer() {
         subscriber_room_memberships: counts.subscriber_room_memberships,
         tenant_room_listeners: counts.tenant_room_listeners,
         device_subscription_memberships: counts.device_subscription_memberships,
-        strip_truccer_dev_status: STRIP_TRUCCER_DEV_STATUS,
         max_live_fix_age_ms: MAX_LIVE_FIX_AGE_MS,
         live_fix_future_tolerance_ms: LIVE_FIX_FUTURE_TOLERANCE_MS,
         live_device_time_fallback: LIVE_DEVICE_TIME_FALLBACK,
@@ -1678,32 +1645,11 @@ async function resolveImei(deviceId) {
 }
 
 async function resolveRuntimeDeviceIdByImei(imei) {
-  const normalized = String(imei || "").trim();
-  if (!normalized) throw new Error("imei_required");
-  if (!traccarHttpClient) throw new Error("traccar_client_not_ready");
-
-  const { data } = await traccarHttpClient.get("/api/devices", {
-    params: { uniqueId: normalized },
+  return resolveRuntimeDeviceIdByImeiViaTraccar({
+    client: traccarHttpClient,
+    imei,
+    cache: deviceIdToImeiCache,
   });
-  const list = Array.isArray(data) ? data : data ? [data] : [];
-  const matches = list.filter((dev) => String(dev?.uniqueId || "").trim() === normalized);
-  if (matches.length !== 1) {
-    const err = new Error(
-      matches.length === 0
-        ? "device_not_registered_in_traccar_runtime"
-        : "multiple_runtime_devices_for_imei"
-    );
-    err.statusCode = matches.length === 0 ? 404 : 409;
-    throw err;
-  }
-  const runtimeId = Number(matches[0].id);
-  if (!Number.isFinite(runtimeId)) {
-    const err = new Error("invalid_runtime_device_id");
-    err.statusCode = 502;
-    throw err;
-  }
-  deviceIdToImeiCache.set(runtimeId, normalized);
-  return runtimeId;
 }
 
 async function ensureState(imei) {
@@ -1981,48 +1927,10 @@ const TRACCAR_OVERSPEED_HOOKS = {
   onOverspeedEnd: traccarOverspeedOnEnd,
 };
 
-/** Lower = process first in Traccar WS batches (command responses before GPS flood). */
-function positionIngressPriority(position) {
-  const attrs = position?.attributes || {};
-  if (String(attrs.result || "").trim()) return 0;
-  if (attrs.alarm) return 1;
-  return 2;
-}
-
-function sortPositionsForIngress(positions) {
-  return [...positions].sort(
-    (a, b) => positionIngressPriority(a) - positionIngressPriority(b)
-  );
-}
-
 function emitPositionToSocketSubscribers(imei, docType, subscriberData, { immediate = false } = {}) {
   const payload = { type: docType, data: subscriberData };
   if (immediate) broadcastToDeviceSubscribersImmediate(imei, payload);
   else broadcastToDeviceSubscribers(imei, payload);
-}
-
-async function ensureDevicestatusPresent(imei, deviceId) {
-  if (!SHOULD_USE_TRACCAR_WS) return;
-  try {
-    const now = Date.now();
-    const lastSync = statusSyncCooldowns.get(imei) || 0;
-    if (now - lastSync >= STATUS_SYNC_COOLDOWN_MS) {
-      const exists = await mongoose.connection
-        .collection("devicestatuses")
-        .findOne({ imei }, { projection: { _id: 1 } });
-      if (!exists) {
-        console.warn("devicestatuses missing for IMEI, syncing from Traccar", { imei, deviceId });
-        statusSyncCooldowns.set(imei, now);
-        await fetchTraccarDeviceById(deviceId, "missing_devicestatus");
-      }
-    }
-  } catch (err) {
-    console.warn("Failed to verify devicestatuses presence", {
-      imei,
-      deviceId,
-      error: err.message,
-    });
-  }
 }
 
 function buildCommandResponseSubscriberPayload(imei, position, commandResponseText, extra = {}) {
@@ -2167,7 +2075,7 @@ function processCommandResponseIngressDeferred(position) {
 
 function warmImeiCacheFromForwardItem(item) {
   const imei = item?.imei ? String(item.imei).trim() : "";
-  const deviceId = Number(item?.deviceId ?? item?.position?.deviceId);
+  const deviceId = Number(item?.runtimeDeviceId ?? item?.position?.deviceId);
   if (!imei || !Number.isFinite(deviceId)) return null;
   deviceIdToImeiCache.set(deviceId, imei);
   return imei;
@@ -2176,15 +2084,12 @@ function warmImeiCacheFromForwardItem(item) {
 function resolveImeiForForwardItem(item) {
   const direct = item?.imei ? String(item.imei).trim() : "";
   if (direct) return direct;
-  return resolveImeiFromCache(item?.deviceId ?? item?.position?.deviceId);
+  return resolveImeiFromCache(item?.runtimeDeviceId ?? item?.position?.deviceId);
 }
 
 async function processForwardIngressAsync(normalized, receivedAt) {
   const items = Array.isArray(normalized?.items) ? normalized.items : [];
   if (!items.length) return;
-
-  compareForwardShadowPositions(items);
-  if (!SHOULD_PROCESS_FORWARD) return;
 
   const grouped = new Map();
   for (const item of items) {
@@ -2370,9 +2275,6 @@ function persistPositionBody(imei, position, rawPayload, options = {}) {
     return;
   }
 
-  setImmediate(() => {
-    ensureDevicestatusPresent(imei, position?.deviceId).catch(() => {});
-  });
   const latitude = Number(position?.latitude);
   const longitude = Number(position?.longitude);
   // Traccar position.speed is in knots -> convert to km/h
@@ -2903,277 +2805,15 @@ async function persistPositionHeavy(ctx) {
 
 persistPositionHeavyRef = persistPositionHeavy;
 
-function normalizeEventTypeForAlarm(typeStr) {
-  const t = String(typeStr || "").toLowerCase().replace(/\s+/g, "");
-  if (t === "overspeed" || t === "lowspeed" || t === "hardacceleration") return t;
-  return null;
-}
-
-async function persistEvent(eventObj) {
-  const imei = await resolveImei(eventObj?.deviceId);
-  if (!imei) return;
-
-  const eventTypeToken = normalizeAlarmToken(eventObj?.type);
-  const eventAlarmToken = normalizeAlarmToken(
-    eventObj?.attributes?.alarm ?? eventObj?.alarm ?? eventObj?.eventType ?? ""
-  );
-  if (
-    IGNORED_ALARM_CODES.has(eventTypeToken) ||
-    IGNORED_ALARM_CODES.has(eventAlarmToken) ||
-    (eventTypeToken === "alarm" && IGNORED_ALARM_CODES.has(eventAlarmToken))
-  ) {
-    return;
-  }
-
-  const packetDate = toDate(eventObj?.eventTime || eventObj?.serverTime || eventObj?.deviceTime);
-  const typeText = String(eventObj?.type || "event");
-  const alarmText = `Traccar event: ${typeText}`;
-
-  const eventAlarmCode = normalizeEventTypeForAlarm(eventObj?.type);
-  if (eventAlarmCode) {
-    setImmediate(() => {
-      handleOverspeedSample(imei, 0, null, null, packetDate, {
-        alarmCodes: [eventAlarmCode],
-        hooks: TRACCAR_OVERSPEED_HOOKS,
-      }).catch((e) => console.warn("Overspeed event sample error:", e.message));
-    });
-  }
-
-  const eventAccOn = powerEventToAccOn(eventObj?.type);
-  if (eventAccOn !== null) {
-    const triggeredBy = String(eventObj?.type || "").toLowerCase().replace(/\s+/g, "");
-    setImmediate(() => {
-      handleAccSample(imei, eventAccOn, null, null, packetDate, {
-        triggeredBy: triggeredBy || "poweron",
-        // persistEvent يُنشئ GpsLog للحدث؛ نتجنب تكرار سجل ACC في gps_logs
-        skipGpsLog: true,
-      });
-    });
-  }
-
-  const eventDoc = {
-    imei,
-    type: "alarm",
-    subType: "traccar_event",
-    alarmType: typeText,
-    alarmText,
-    alarmTextAr: `تنبيه تراكر: ${typeText}`,
-    packet_date: packetDate,
-    date: packetDate,
-    deviceId: eventObj?.deviceId ?? null,
-    traccar_event_id: eventObj?.id ?? null,
-    traccar_position_id: eventObj?.positionId ?? null,
-    traccar_event: eventObj,
-  };
-
-  const subscriberData = mergeLegacyAndTraccarPayload({
-    legacyDoc: eventDoc,
-    traccarData: eventObj,
-    traccarType: "event",
-    source: "traccar_event",
-  });
-
-  const eventCls = classifyLiveFix(
-    { fixTime: eventObj?.eventTime, deviceTime: eventObj?.deviceTime, serverTime: eventObj?.serverTime },
-    { maxLiveAgeMs: MAX_LIVE_FIX_AGE_MS, futureToleranceMs: LIVE_FIX_FUTURE_TOLERANCE_MS }
-  );
-
-  if (eventCls.liveEligible) {
-    emitPositionToSocketSubscribers(imei, "alarm", subscriberData);
-  }
-
-  setImmediate(() => {
-    gpsLogsWriter.writeOneFireAndForget(eventDoc);
-    if (!eventCls.liveEligible) return;
-    SEND_NOTIFY_TO_CLIENT(imei, `تنبيه ${imei}`, eventDoc.alarmTextAr, {
-      type: "alarm",
-      subType: eventDoc.subType,
-      alarmType: eventDoc.alarmType,
-      alarmText: eventDoc.alarmText,
-      alarmTextAr: eventDoc.alarmTextAr,
-      imei,
-    }).catch((e) => console.error("Event notify error:", e.message));
-  });
-}
-
-async function persistTraccarDeviceStatus(traccarDevice) {
-  const imei = traccarDevice?.uniqueId ? String(traccarDevice.uniqueId).trim() : null;
-  if (!imei) {
-    console.warn("Traccar device status skipped (missing uniqueId)", { id: traccarDevice?.id });
-    return;
-  }
-
-  const status = traccarDevice?.status ?? null; // online/offline/unknown
-  const lastUpdate = traccarDevice?.lastUpdate ?? null;
-
-
-
-
-
-
-
-  // store minimal fields at root; full Traccar device blob optional (STRIP_TRUCCER_DEV_STATUS)
-  const statusUpsert = {
-    imei,
-    type: "device",
-    packetDate: lastUpdate,
-    status,
-    lastUpdate,
-  };
-  if (!STRIP_TRUCCER_DEV_STATUS) {
-    statusUpsert.truccer_dev_status = traccarDevice;
-  }
-  const statusDoc = await upsertDeviceStatus(statusUpsert);
-
-  const legacyDoc = {
-    imei,
-    type: "device",
-    status,
-    lastUpdate,
-  };
-  if (!STRIP_TRUCCER_DEV_STATUS) {
-    legacyDoc.truccer_dev_status = traccarDevice;
-  }
-
-  const subscriberData = mergeLegacyAndTraccarPayload({
-    legacyDoc,
-    traccarData: traccarDevice,
-    traccarType: "device",
-    source: "traccar_device",
-  });
-  if (STRIP_TRUCCER_DEV_STATUS) {
-    delete subscriberData.truccer_dev_status;
-    if (subscriberData.legacy && typeof subscriberData.legacy === "object") {
-      delete subscriberData.legacy.truccer_dev_status;
-    }
-  }
-
-  broadcastToDeviceSubscribers(imei, { type: "device", data: subscriberData });
-  return statusDoc;
-}
-
-async function loginAndGetCookieHeader() {
-  if (!USERNAME || !PASSWORD) {
-    throw new Error("traccar_credentials_not_configured");
-  }
-  const jar = new CookieJar();
-  const client = wrapper(
-    axios.create({
-      baseURL: TRACCAR_BASE,
-      jar,
-      withCredentials: true,
-      timeout: 15000,
-    })
-  );
-
-  const form = new URLSearchParams();
-  form.append("email", USERNAME);
-  form.append("password", PASSWORD);
-
-  await client.post("/api/session", form.toString(), {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  });
-
-  const cookies = await jar.getCookies(TRACCAR_BASE);
-  const cookieHeader = cookies.map((c) => `${c.key}=${c.value}`).join("; ");
-  if (!cookieHeader) throw new Error("Login succeeded but no session cookie found.");
-  return { cookieHeader, client };
-}
-
 function createTraccarBearerClient() {
-  const headers = TRACCAR_SERVICE_TOKEN
-    ? { Authorization: `Bearer ${TRACCAR_SERVICE_TOKEN}` }
-    : {};
+  if (!TRACCAR_SERVICE_TOKEN) {
+    throw new Error("TRACCAR_SERVICE_TOKEN is required");
+  }
   return axios.create({
     baseURL: TRACCAR_BASE,
     timeout: 15000,
-    headers,
+    headers: { Authorization: `Bearer ${TRACCAR_SERVICE_TOKEN}` },
   });
-}
-
-async function createTraccarRestClient() {
-  if (TRACCAR_SERVICE_TOKEN) {
-    return { client: createTraccarBearerClient(), authType: "bearer" };
-  }
-  if (USERNAME && PASSWORD) {
-    const { client } = await loginAndGetCookieHeader();
-    return { client, authType: "session" };
-  }
-  return { client: createTraccarBearerClient(), authType: "none" };
-}
-
-async function getTraccarSocketAuth() {
-  if (TRACCAR_SERVICE_TOKEN) {
-    return {
-      headers: { Authorization: `Bearer ${TRACCAR_SERVICE_TOKEN}` },
-      client: createTraccarBearerClient(),
-      authType: "bearer",
-    };
-  }
-  const { cookieHeader, client } = await loginAndGetCookieHeader();
-  return {
-    headers: { Cookie: cookieHeader },
-    client,
-    authType: "session",
-  };
-}
-
-function startWebSocket(headers = {}) {
-  const ws = new WebSocket(TRACCAR_WS, { headers });
-  const realtimeIngress = createRealtimeIngress({
-    metrics: bridgeMetrics,
-    groupByDeviceId,
-    resolveImeiFromCache,
-    bumpTraccarPositionsReceived,
-    tryProcessCommandResponseIngressSync,
-    processCommandResponseIngressDeferred,
-    processGpsBurst,
-    persistPosition,
-    warmImeiCacheFromTraccarDevice,
-    persistTraccarDeviceStatus,
-    persistEvent,
-    hasLegacySubscribers: () => true,
-  });
-
-  ws.on("open", () => {
-    console.log("Connected to Traccar WebSocket");
-    closingForReconnect = false;
-    bridgeMetrics.traccar_ws_connected = true;
-    bridgeMetrics.traccar_ws_connected_at = new Date().toISOString();
-    traccarReconnect.notifySuccess();
-  });
-
-  ws.on("message", (msg) => {
-    bridgeMetrics.last_traccar_message_at = new Date().toISOString();
-    let data;
-    try {
-      data = normalizeIncomingPayload(msg);
-    } catch (err) {
-      console.error("Failed to parse Traccar message:", err.message);
-      return;
-    }
-
-    if (!data || typeof data !== "object") return;
-    if (Array.isArray(data.positions)) rememberWsShadowPositions(data.positions);
-    void realtimeIngress.handleMessage(data);
-  });
-
-  ws.on("close", (code, reason) => {
-    console.error(`WS closed: ${code} ${reason?.toString?.() || ""}`);
-    bridgeMetrics.traccar_ws_connected = false;
-    if (closingForReconnect) {
-      closingForReconnect = false;
-      return;
-    }
-    traccarReconnect.onSocketClose("ws_close");
-  });
-
-  ws.on("error", (err) => {
-    console.error("WS error:", err.message);
-    traccarReconnect.onSocketError();
-  });
-
-  return ws;
 }
 
 async function bootBridge() {
@@ -3184,45 +2824,21 @@ async function bootBridge() {
   startIdleStatsScheduler({ idleSpeedKph: 0, idleMinutes: 5, requireAccOn: true, maxGapSeconds: 10 * 60 });
   startStaticStatsScheduler();
 
-  const rest = await createTraccarRestClient();
-  traccarHttpClient = rest.client;
+  traccarHttpClient = createTraccarBearerClient();
   console.log("Traccar REST client configured", {
     baseURL: TRACCAR_BASE,
-    auth: rest.authType,
-    ingress_mode: TRACCAR_INGRESS_MODE,
+    auth: "bearer",
   });
-
-  if (!SHOULD_USE_TRACCAR_WS) {
-    console.log("Traccar WebSocket ingress disabled by TRACCAR_INGRESS_MODE=forward");
-    return;
-  }
-
-  startDevicesPolling();
-  await fetchTraccarDevicesList("startup_login");
-  if (WS_REFRESH_MS > 0) {
-    setInterval(() => scheduleReconnect("periodic_refresh", 0), WS_REFRESH_MS);
-  }
-  const socketAuth = await getTraccarSocketAuth();
-  traccarHttpClient = socketAuth.client;
-  traccarWs = startWebSocket(socketAuth.headers);
-  bridgeMetrics.traccar_ws_connected = true;
-  bridgeMetrics.traccar_ws_connected_at = new Date().toISOString();
 }
 
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.warn("[bridge] graceful shutdown", { signal });
-  traccarReconnect.stop();
-  traccarWatchdog.stop();
-  try {
-    if (traccarWs) traccarWs.close();
-  } catch {
-    /* ignore */
-  }
   try {
     await Promise.race([
       Promise.all([
+        forwardQueue.flushAndStop(BRIDGE_ENV.BRIDGE_SHUTDOWN_TIMEOUT_MS),
         gpsPointWriter.flushAndStop(BRIDGE_ENV.BRIDGE_SHUTDOWN_TIMEOUT_MS),
         persistenceIpc.flushAndStop(BRIDGE_ENV.BRIDGE_SHUTDOWN_TIMEOUT_MS),
       ]),
@@ -3239,5 +2855,5 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 bootBridge().catch((e) => {
   console.error("Bridge failed:", e.message);
-  traccarReconnect.schedule("boot_failed");
+  process.exit(1);
 });

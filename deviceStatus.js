@@ -2,27 +2,6 @@
  * Atomic DeviceStatus GPS updates — never regress last_fix / coords from older packets.
  */
 
-function isOnlineStatus(status) {
-  return status != null && String(status).toLowerCase() === "online";
-}
-
-function buildStatusUpsertPipeline(update) {
-  const now = new Date();
-  const $set = {
-    ...update,
-    km_total: { $ifNull: ["$km_total", 0] },
-    miles_total: { $ifNull: ["$miles_total", 0] },
-    updatedAt: now,
-  };
-
-  if (isOnlineStatus(update.status)) {
-    $set.activation_at = { $ifNull: ["$activation_at", now] };
-    $set.createdAt = { $ifNull: ["$createdAt", now] };
-  }
-
-  return [{ $set }];
-}
-
 function newerFixCondition(fixAt) {
   return {
     $or: [
@@ -107,14 +86,6 @@ function buildGpsStatusUpdatePipeline({
 
   if (update.last_voltage !== undefined) $set.last_voltage = update.last_voltage;
   if (update.last_voltage_unit !== undefined) $set.last_voltage_unit = update.last_voltage_unit;
-  if (update.status !== undefined) $set.status = update.status;
-  if (update.lastUpdate !== undefined) $set.lastUpdate = update.lastUpdate;
-  if (update.truccer_dev_status !== undefined) $set.truccer_dev_status = update.truccer_dev_status;
-
-  if (isOnlineStatus(update.status)) {
-    $set.activation_at = { $ifNull: ["$activation_at", now] };
-    $set.createdAt = { $ifNull: ["$createdAt", now] };
-  }
 
   return [{ $set }];
 }
@@ -133,9 +104,6 @@ async function upsertDeviceStatus(params) {
     voltage,
     voltageUnit,
     direction,
-    status,
-    lastUpdate,
-    truccer_dev_status,
   } = params;
 
   if (!imei) return;
@@ -144,32 +112,10 @@ async function upsertDeviceStatus(params) {
   const fixValid = !!(fixAt && !Number.isNaN(fixAt.getTime()));
   const ingressAt = serverDate ? new Date(serverDate) : fixAt;
   const ingressValid = !!(ingressAt && !Number.isNaN(ingressAt.getTime()));
-  const isDeviceOnly = type === "device";
 
   const update = {
     last_type: type,
   };
-
-  if (isDeviceOnly) {
-    if (ingressValid) {
-      update.last_device_online_at = ingressAt;
-    }
-    if (status !== undefined) {
-      update.status = status;
-    }
-    if (lastUpdate !== undefined && lastUpdate !== null && lastUpdate !== "") {
-      const d = new Date(lastUpdate);
-      update.lastUpdate = !Number.isNaN(d.getTime()) ? d : lastUpdate;
-    }
-    if (truccer_dev_status !== undefined) {
-      update.truccer_dev_status = truccer_dev_status;
-    }
-    return DeviceStatus.findOneAndUpdate(
-      { imei },
-      buildStatusUpsertPipeline(update),
-      { upsert: true, new: true }
-    );
-  }
 
   const attrsTypeNum = Number(attrsType);
   const hasCoords = lat !== undefined && lon !== undefined;
@@ -178,12 +124,6 @@ async function upsertDeviceStatus(params) {
     update.last_voltage = voltage;
     if (voltageUnit) update.last_voltage_unit = voltageUnit;
   }
-  if (status !== undefined) update.status = status;
-  if (lastUpdate !== undefined && lastUpdate !== null && lastUpdate !== "") {
-    const d = new Date(lastUpdate);
-    update.lastUpdate = !Number.isNaN(d.getTime()) ? d : lastUpdate;
-  }
-  if (truccer_dev_status !== undefined) update.truccer_dev_status = truccer_dev_status;
 
   return DeviceStatus.findOneAndUpdate(
     { imei },
@@ -206,8 +146,6 @@ async function upsertDeviceStatus(params) {
 
 module.exports = {
   upsertDeviceStatus,
-  buildStatusUpsertPipeline,
   buildGpsStatusUpdatePipeline,
   newerFixCondition,
-  isOnlineStatus,
 };

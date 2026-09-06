@@ -3,8 +3,7 @@ const assert = require("node:assert/strict");
 const { EventEmitter } = require("events");
 const { createWsDelivery } = require("../lib/wsDelivery");
 const { attachSubscriberHeartbeat } = require("../lib/subscriberHeartbeat");
-const { createTraccarReconnect } = require("../lib/traccarReconnect");
-const { createDevicesListBackoff, createDeviceResolver } = require("../lib/deviceResolve");
+const { createDeviceResolver } = require("../lib/deviceResolve");
 const { createBridgeMetrics, snapshotMetrics } = require("../lib/bridgeMetrics");
 const { buildGpsStatusUpdatePipeline } = require("../deviceStatus");
 
@@ -107,61 +106,6 @@ describe("subscriber heartbeat", () => {
   });
 });
 
-describe("traccar reconnect state machine", () => {
-  it("retries after login failures until success without external trigger", async () => {
-    let calls = 0;
-    const reconnect = createTraccarReconnect({
-      baseMs: 10,
-      maxMs: 40,
-      metrics: createBridgeMetrics(),
-      shouldConnect: () => true,
-      isSocketHealthy: () => calls >= 3,
-      connect: async () => {
-        calls += 1;
-        if (calls < 3) throw new Error("login failed");
-      },
-    });
-    reconnect.schedule("test", { immediate: true });
-    const start = Date.now();
-    while (calls < 3 && Date.now() - start < 2000) {
-      await new Promise((r) => setTimeout(r, 20));
-    }
-    assert.ok(calls >= 3);
-    reconnect.stop();
-  });
-
-  it("never stays dead without a timer after failure", async () => {
-    const reconnect = createTraccarReconnect({
-      baseMs: 15,
-      maxMs: 15,
-      metrics: createBridgeMetrics(),
-      connect: async () => {
-        throw new Error("fail");
-      },
-    });
-    await reconnect.attemptConnect("x");
-    assert.equal(reconnect.snapshot().timerPending, true);
-    reconnect.stop();
-  });
-});
-
-describe("devices list backoff semantics", () => {
-  it("first failure waits BASE, not BASE*2", () => {
-    let now = 1000;
-    const b = createDevicesListBackoff({ baseMs: 60_000, maxMs: 120_000, now: () => now });
-    const wait = b.onFailure();
-    assert.equal(wait, 60_000);
-    now = 1000 + 59_000;
-    assert.equal(b.allowed(), false);
-    now = 1000 + 60_000;
-    assert.equal(b.allowed(), true);
-    const wait2 = b.onFailure();
-    assert.equal(wait2, 120_000);
-    b.onSuccess();
-    assert.equal(b.nextDelay, 60_000);
-  });
-});
-
 describe("device fetch in-flight sharing", () => {
   it("50 unknown-device positions share one fetch", async () => {
     let fetches = 0;
@@ -248,16 +192,16 @@ describe("health snapshot names", () => {
     assert.equal("coalesced_dropped" in snap, false);
   });
 
-  it("exposes positions vs devices timestamps and live pipeline counters", () => {
+  it("exposes final http-forward ingress and live pipeline counters", () => {
     const metrics = createBridgeMetrics();
-    metrics.last_traccar_message_at = "2026-08-18T12:00:00.000Z";
-    metrics.last_traccar_positions_message_at = "2026-08-18T11:59:00.000Z";
-    metrics.last_traccar_devices_message_at = "2026-08-18T12:00:00.000Z";
+    metrics.forward_positions_received_total = 3;
+    metrics.forward_queue_depth = 1;
     metrics.live_eligible_total = 3;
     metrics.tenant_gps_emitted_total = 1;
     const snap = snapshotMetrics(metrics);
-    assert.equal(snap.last_traccar_positions_message_at, "2026-08-18T11:59:00.000Z");
-    assert.equal(snap.last_traccar_devices_message_at, "2026-08-18T12:00:00.000Z");
+    assert.equal(snap.traccar_ingress, "http-forward");
+    assert.equal(snap.forward_positions_received_total, 3);
+    assert.equal(snap.forward_queue_depth, 1);
     assert.equal(snap.live_eligible_total, 3);
     assert.equal(snap.tenant_gps_emitted_total, 1);
     assert.equal(snap.live_fix_stale_device_fresh_total, 0);

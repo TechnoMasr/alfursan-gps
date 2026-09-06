@@ -1,11 +1,12 @@
 // mongo.js
 const mongoose = require('mongoose');
-const uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/gps-server';
+const path = require('path');
 
-mongoose.connect(uri, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+const uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/admin';
+
+mongoose.connect(uri)
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => console.error('❌ MongoDB connection error:', err.message));
 
@@ -316,7 +317,6 @@ accEventSchema.index({ imei: 1, start_time: -1 });
 accEventSchema.set("collection", "acc_events");
 
 gpsBufferSchema.index({ imei: 1, date: -1 });
-deviceStatusSchema.index({ imei: 1 });
 
 const GpsLog = mongoose.model('GpsLog', gpsLogSchema);
 const GpsLog2 = mongoose.model('GpsLog', gpsLogSchema);

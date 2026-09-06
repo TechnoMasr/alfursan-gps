@@ -1,3 +1,7 @@
+const path = require("path");
+
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
+
 const { configureGpsLogsWriter } = require("../lib/gpsLogsWriter");
 const { createGpsPointWriter } = require("../lib/gpsPointWriter");
 const { setGpsPointWriter, enqueueGpsPoint } = require("../gpsPointStore");
