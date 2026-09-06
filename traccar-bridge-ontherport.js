@@ -38,6 +38,7 @@ const { createImeiDebugger } = require("./lib/imeiDebug");
 const { countSubscriberMetrics } = require("./lib/subscriberCounts");
 const { createTenantRoomGpsThrottle } = require("./lib/tenantRoomGpsThrottle");
 const { runStartupConnectivityReconciliation } = require("./lib/startupConnectivityReconciliation");
+const { createTraccarModelSync } = require("./lib/traccarModelSync");
 const {
   verifyForwardBearer,
   isJsonContentType,
@@ -137,6 +138,8 @@ const persistenceIpc = createPersistenceIpc({
   metrics: bridgeMetrics,
   maxQueueBatches: BRIDGE_ENV.PERSISTENCE_IPC_MAX_QUEUE_BATCHES || 512,
   maxBatchSize: BRIDGE_ENV.PERSISTENCE_IPC_MAX_BATCH_SIZE || 2000,
+  batchMaxItems: BRIDGE_ENV.PERSISTENCE_IPC_BATCH_MAX_ITEMS || 100,
+  batchMaxWaitMs: BRIDGE_ENV.PERSISTENCE_IPC_BATCH_MAX_WAIT_MS || 5,
   spoolDir: BRIDGE_ENV.PERSISTENCE_IPC_SPOOL_DIR,
 });
 console.log(`persistence_worker_pid=${persistenceIpc.getWorkerPid() || "starting"}`);
@@ -263,6 +266,7 @@ async function warmImeiToRoomCacheFromMongo() {
 }
 let subscribersServerStarted = false;
 let traccarHttpClient = null;
+let traccarModelSync = null;
 let persistPositionHeavyRef = async () => {};
 const analyticsQueue = {
   enqueue() {},
@@ -767,7 +771,30 @@ function warmImeiCacheFromTraccarDevice(traccarDevice) {
   const imei = traccarDevice?.uniqueId ? String(traccarDevice.uniqueId).trim() : null;
   if (!Number.isFinite(mysqlId) || !imei) return null;
   deviceIdToImeiCache.set(mysqlId, imei);
+  scheduleTraccarModelSyncForDevice({
+    imei,
+    runtimeDeviceId: mysqlId,
+    currentModel: traccarDevice?.model,
+    forwardedDevice: traccarDevice,
+  });
   return imei;
+}
+
+function scheduleTraccarModelSyncForDevice({ imei, runtimeDeviceId, currentModel, forwardedDevice } = {}) {
+  if (!traccarModelSync) return;
+  const result = traccarModelSync.schedule({
+    imei,
+    runtimeDeviceId,
+    currentModel,
+    forwardedDevice,
+  });
+  if (result && result.accepted === false) {
+    console.warn("[traccar-model-sync] schedule skipped", {
+      imei,
+      runtime_id: runtimeDeviceId,
+      reason: result.reason,
+    });
+  }
 }
 
 function positionHasCommandResponse(position) {
@@ -898,11 +925,32 @@ function startSubscribersServer() {
       ipc_spool_depth: bridgeMetrics.ipc_spool_depth || 0,
       ipc_spool_failures_total: bridgeMetrics.ipc_spool_failures_total || 0,
       ipc_send_backpressure_total: bridgeMetrics.ipc_send_backpressure_total || 0,
+      ipc_batches_sent_total: bridgeMetrics.ipc_batches_sent_total || bridgeMetrics.ipc_batches_sent || 0,
+      ipc_items_sent_total: bridgeMetrics.ipc_items_sent_total || 0,
+      ipc_batch_accumulator_depth: bridgeMetrics.ipc_batch_accumulator_depth || 0,
+      ipc_batch_avg_size: bridgeMetrics.ipc_batch_avg_size || 0,
+      ipc_batch_max_size: bridgeMetrics.ipc_batch_max_size || 0,
+      ipc_ack_latency_ms: bridgeMetrics.ipc_ack_latency_ms || 0,
+      ipc_ack_latency_max_ms: bridgeMetrics.ipc_ack_latency_max_ms || 0,
+      gpspoints_journaled_total: bridgeMetrics.gpspoints_journaled_total || 0,
+      gpspoints_mongo_flush_count: bridgeMetrics.gpspoints_mongo_flush_count || 0,
+      gpspoints_mongo_docs_per_flush_last: bridgeMetrics.gpspoints_mongo_docs_per_flush_last || 0,
+      gpspoints_mongo_docs_per_flush_avg: bridgeMetrics.gpspoints_mongo_docs_per_flush_avg || 0,
+      gpspoints_mongo_docs_per_flush_max: bridgeMetrics.gpspoints_mongo_docs_per_flush_max || 0,
       startup_reconciliation_last_run_at: bridgeMetrics.startup_reconciliation_last_run_at || null,
       startup_reconciliation_traccar_devices: bridgeMetrics.startup_reconciliation_traccar_devices || 0,
       startup_reconciliation_mongo_online: bridgeMetrics.startup_reconciliation_mongo_online || 0,
       startup_reconciliation_marked_offline: bridgeMetrics.startup_reconciliation_marked_offline || 0,
       startup_reconciliation_failures: bridgeMetrics.startup_reconciliation_failures || 0,
+      traccar_model_sync_requested_total: bridgeMetrics.traccar_model_sync_requested_total || 0,
+      traccar_model_sync_success_total: bridgeMetrics.traccar_model_sync_success_total || 0,
+      traccar_model_sync_failed_total: bridgeMetrics.traccar_model_sync_failed_total || 0,
+      traccar_model_sync_skipped_no_model_total: bridgeMetrics.traccar_model_sync_skipped_no_model_total || 0,
+      traccar_model_sync_already_correct_total: bridgeMetrics.traccar_model_sync_already_correct_total || 0,
+      traccar_model_sync_pending: bridgeMetrics.traccar_model_sync_pending || 0,
+      traccar_model_sync_queue_depth: bridgeMetrics.traccar_model_sync_queue_depth || 0,
+      traccar_model_cache_size: bridgeMetrics.traccar_model_cache_size || 0,
+      traccar_model_sync_last_success_at: bridgeMetrics.traccar_model_sync_last_success_at || null,
       persistence_health: persistenceHealth,
       gpspoint_spool_dir: writerStats.gpspoint_spool_dir,
       ts: new Date().toISOString(),
@@ -2082,10 +2130,19 @@ async function processForwardIngressAsync(normalized, receivedAt) {
   const grouped = new Map();
   for (const item of items) {
     warmImeiCacheFromForwardItem(item);
+    const observedImei = resolveImeiForForwardItem(item);
+    if (observedImei) {
+      scheduleTraccarModelSyncForDevice({
+        imei: observedImei,
+        runtimeDeviceId: item?.runtimeDeviceId ?? item?.position?.deviceId,
+        currentModel: item?.position?.deviceModel ?? item?.runtimeDevice?.model,
+        forwardedDevice: item?.runtimeDevice,
+      });
+    }
     const position = item.position;
     const commandText = String(position?.attributes?.result || "").trim();
     if (commandText) {
-      const imei = resolveImeiForForwardItem(item);
+      const imei = observedImei;
       if (imei) {
         persistCommandResponseFast(imei, position, commandText);
       } else if (!tryProcessCommandResponseIngressSync(position)) {
@@ -2096,7 +2153,7 @@ async function processForwardIngressAsync(normalized, receivedAt) {
       continue;
     }
 
-    const imei = resolveImeiForForwardItem(item);
+    const imei = observedImei;
     if (imei) {
       if (!grouped.has(imei)) grouped.set(imei, []);
       grouped.get(imei).push(position);
@@ -2836,8 +2893,19 @@ function createTraccarBearerClient() {
 }
 
 async function bootBridge() {
-  startSubscribersServer();
   traccarHttpClient = createTraccarBearerClient();
+  traccarModelSync = createTraccarModelSync({
+    getClient: () => traccarHttpClient,
+    metrics: bridgeMetrics,
+    log: console,
+    concurrency: BRIDGE_ENV.TRACCAR_MODEL_SYNC_CONCURRENCY,
+    queueMax: BRIDGE_ENV.TRACCAR_MODEL_SYNC_QUEUE_MAX,
+    modelCacheTtlMs: BRIDGE_ENV.TRACCAR_MODEL_CACHE_TTL_MS,
+    negativeModelCacheTtlMs: BRIDGE_ENV.TRACCAR_MODEL_NEGATIVE_CACHE_TTL_MS,
+    retryBaseMs: BRIDGE_ENV.TRACCAR_MODEL_SYNC_RETRY_BASE_MS,
+    retryMaxMs: BRIDGE_ENV.TRACCAR_MODEL_SYNC_RETRY_MAX_MS,
+  });
+  startSubscribersServer();
   console.log("Traccar REST client configured", {
     baseURL: TRACCAR_BASE,
     auth: "bearer",
@@ -2847,6 +2915,20 @@ async function bootBridge() {
     traccarClient: traccarHttpClient,
     metrics: bridgeMetrics,
     log: console,
+    onTraccarDevices: (devices) => {
+      for (const device of devices || []) {
+        const imei = device?.uniqueId ? String(device.uniqueId).trim() : "";
+        const runtimeDeviceId = Number(device?.id);
+        if (!imei || !Number.isFinite(runtimeDeviceId)) continue;
+        deviceIdToImeiCache.set(runtimeDeviceId, imei);
+        scheduleTraccarModelSyncForDevice({
+          imei,
+          runtimeDeviceId,
+          currentModel: device?.model,
+          forwardedDevice: device,
+        });
+      }
+    },
   });
   startMileageScheduler();
   startTravelStatsScheduler({ stopThresholdsMinutes: [1, 3, 5, 10, 15, 30, 60] });

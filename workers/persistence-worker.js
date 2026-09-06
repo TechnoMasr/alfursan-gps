@@ -105,8 +105,13 @@ const WORKER_METRIC_KEYS = [
   "gpspoints_spool_bytes",
   "gpspoints_spool_oldest_age_ms",
   "gpspoints_spool_write_failures",
+  "gpspoints_journaled_total",
   "gpspoints_mongo_attempted_total",
   "gpspoints_mongo_acknowledged_total",
+  "gpspoints_mongo_flush_count",
+  "gpspoints_mongo_docs_per_flush_last",
+  "gpspoints_mongo_docs_per_flush_avg",
+  "gpspoints_mongo_docs_per_flush_max",
   "gpspoints_duplicate_already_persisted_total",
   "gpspoints_unexpected_duplicate_total",
   "gpspoints_persist_failures",
@@ -469,7 +474,6 @@ function processPositionItem(ctx) {
       traccar_position_id: doc.traccar_position_id ?? doc?.id ?? null,
     });
   }
-  enqueueBusiness(ctx);
 }
 
 async function processBusinessItem(ctx) {
@@ -661,13 +665,16 @@ async function pumpBusinessQueue() {
 async function processBatch(batch) {
   const items = Array.isArray(batch?.items) ? batch.items : [];
   for (const item of items) {
-    await processPositionItem(item);
+    processPositionItem(item);
   }
   if (typeof gpsPointWriter.journalNow === "function") {
-    gpsPointWriter.journalNow();
+    const journaled = gpsPointWriter.journalNow();
+    if (!journaled) {
+      throw new Error("gpspoint_journal_failed");
+    }
   }
-  if (typeof gpsPointWriter.flushCycle === "function") {
-    await gpsPointWriter.flushCycle({ force: true }).catch(() => {});
+  for (const item of items) {
+    enqueueBusiness(item);
   }
   publishWorkerMetrics();
 }

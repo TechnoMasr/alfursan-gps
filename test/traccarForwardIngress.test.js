@@ -23,7 +23,7 @@ describe("traccar forward ingress adapter", () => {
 
   it("normalizes a Traccar-style device + position payload with direct uniqueId", () => {
     const out = normalizeForwardPayload({
-      device: { id: 7, uniqueId: "359339080000001" },
+      device: { id: 7, uniqueId: "359339080000001", name: "359339080000001", model: "SEEWORLD" },
       position: {
         id: 99,
         protocol: "gt06",
@@ -42,7 +42,9 @@ describe("traccar forward ingress adapter", () => {
     assert.equal(out.items.length, 1);
     assert.equal(out.items[0].imei, "359339080000001");
     assert.equal(out.items[0].runtimeDeviceId, 7);
+    assert.equal(out.items[0].runtimeDevice.model, "SEEWORLD");
     assert.equal(out.items[0].position.deviceId, 7);
+    assert.equal(out.items[0].position.deviceModel, "SEEWORLD");
     assert.equal(out.items[0].position.latitude, 24.7136);
     assert.equal(out.items[0].position.longitude, 46.6753);
     assert.equal(out.items[0].position.speed, 10);
