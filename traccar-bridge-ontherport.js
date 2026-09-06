@@ -10,7 +10,10 @@ require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const Trip = require("./trip");
 const { GpsLog, GpsPoint, GpsBuffer, CommandResponse, Notification, TraccarIngressRaw } = require("./mongo");
-const { enqueueGpsPoint, backfillGpsPointsFromLogs } = require("./gpsPointStore");
+const {
+  backfillGpsPointsFromLogs,
+  normalizeTraccarPositionId,
+} = require("./gpsPointStore");
 const { upsertDeviceStatus } = require("./deviceStatus");
 const { loadBridgeEnv } = require("./lib/bridgeEnv");
 const {
@@ -2059,7 +2062,7 @@ function buildCommandResponseGpsDoc(imei, position, commandResponseText) {
     valid: !!position?.valid,
     attributes: attrs,
     deviceId: position?.deviceId ?? null,
-    traccar_position_id: position?.id ?? null,
+    traccar_position_id: normalizeTraccarPositionId(position?.id),
     gps: {
       latitude,
       longitude,
@@ -2378,7 +2381,7 @@ function persistPositionBody(imei, position, rawPayload, options = {}) {
     accuracy: num(position?.accuracy, 0),
     protocol: position?.protocol || null,
     deviceId: position?.deviceId ?? null,
-    traccar_position_id: position?.id ?? null,
+    traccar_position_id: normalizeTraccarPositionId(position?.id),
     traccar_server_time: position?.serverTime || null,
     traccar_device_time: position?.deviceTime || null,
     traccar_fix_time: position?.fixTime || null,
@@ -2538,7 +2541,7 @@ function persistPositionBody(imei, position, rawPayload, options = {}) {
     recordLiveDecision(bridgeMetrics, cls.decision);
     maybeLatencyLog(BRIDGE_ENV.BRIDGE_LATENCY_DEBUG, {
       imei,
-      traccar_position_id: position?.id,
+      traccar_position_id: normalizeTraccarPositionId(position?.id),
       fixTime: position?.fixTime,
       deviceTime: position?.deviceTime,
       serverTime: position?.serverTime,
@@ -2555,7 +2558,7 @@ function persistPositionBody(imei, position, rawPayload, options = {}) {
     recordLiveDecision(bridgeMetrics, liveDecision);
     maybeLatencyLog(BRIDGE_ENV.BRIDGE_LATENCY_DEBUG, {
       imei,
-      traccar_position_id: position?.id,
+      traccar_position_id: normalizeTraccarPositionId(position?.id),
       fixTime: position?.fixTime,
       deviceTime: position?.deviceTime,
       serverTime: position?.serverTime,

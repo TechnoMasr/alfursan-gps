@@ -40,6 +40,24 @@ function printReport(summary) {
   );
 }
 
+function stableJson(value) {
+  if (!value || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+    .join(",")}}`;
+}
+
+function isExpectedIndex(index) {
+  return (
+    stableJson(index?.key) === stableJson(INDEX_KEYS) &&
+    index?.unique === true &&
+    stableJson(index?.partialFilterExpression) ===
+      stableJson(INDEX_OPTIONS.partialFilterExpression)
+  );
+}
+
 async function main() {
   const { create } = parseArgs(process.argv.slice(2));
   const uri = process.env.MONGO_URI || process.env.MONGODB_URI;
@@ -55,6 +73,16 @@ async function main() {
   const existing = await coll.indexes();
   const already = existing.find((idx) => idx.name === INDEX_NAME);
   if (already) {
+    if (!isExpectedIndex(already)) {
+      console.error("Existing index has this name but does not match the expected positive-ID partial filter.");
+      console.error("Review first, then run during a maintenance window if appropriate:");
+      console.error(`db.gpspoints.dropIndex(${JSON.stringify(INDEX_NAME)})`);
+      console.error(
+        `db.gpspoints.createIndex(${JSON.stringify(INDEX_KEYS)}, ${JSON.stringify(INDEX_OPTIONS)})`
+      );
+      await mongoose.disconnect();
+      process.exit(2);
+    }
     console.log("Index already exists:", INDEX_NAME);
     await mongoose.disconnect();
     return;
@@ -85,4 +113,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, main };
+module.exports = { parseArgs, main, isExpectedIndex };

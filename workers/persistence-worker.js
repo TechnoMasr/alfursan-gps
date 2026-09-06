@@ -17,6 +17,7 @@ const { startStaticStatsScheduler } = require("../staticStatsService");
 const { sendPushNotification } = require("../fcm.service");
 const Trip = require("../trip");
 const mongoose = require("mongoose");
+const { GpsLog, GpsPoint } = require("../mongo");
 
 const GPSLOGS_WRITE_ENABLED = String(process.env.GPSLOGS_WRITE_ENABLED ?? "0") === "1";
 const BRIDGE_LATENCY_DEBUG = String(process.env.BRIDGE_LATENCY_DEBUG ?? "0") === "1";
@@ -61,12 +62,13 @@ function isValidGpsCoord(lat, lon) {
 
 const gpsLogsWriter = configureGpsLogsWriter({
   enabled: GPSLOGS_WRITE_ENABLED,
+  GpsLog,
   onAlarm: () => {},
   metrics: bridgeMetrics,
 });
 
 const gpsPointWriter = createGpsPointWriter({
-  insertMany: (docs) => require("../mongo").GpsPoint.insertMany(docs, { ordered: false }),
+  insertMany: (docs) => GpsPoint.insertMany(docs, { ordered: false }),
   spoolDir: process.env.GPSPOINT_SPOOL_DIR || undefined,
   batchSize: Number(process.env.GPSPOINT_BATCH_SIZE || 250) || 250,
   flushMs: Number(process.env.GPSPOINT_FLUSH_MS || 100) || 100,
@@ -323,6 +325,7 @@ async function processPositionItem(ctx) {
   });
   if (doc.type === "gps" && hasValidCoords) {
     enqueueGpsPoint({
+      type: doc.type,
       imei,
       latitude,
       longitude,

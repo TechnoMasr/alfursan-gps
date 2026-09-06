@@ -16,6 +16,11 @@ function shouldStoreGpsPoint({ type, latitude, longitude, attrsType } = {}) {
   return true;
 }
 
+function normalizeTraccarPositionId(value) {
+  const id = Number(value);
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+
 function buildGpsPointDoc({
   imei,
   latitude,
@@ -37,8 +42,8 @@ function buildGpsPointDoc({
     packet_date: packet_date ? new Date(packet_date) : new Date(),
     date: date ? new Date(date) : new Date(),
   };
-  const posId = Number(traccar_position_id);
-  if (Number.isFinite(posId)) doc.traccar_position_id = posId;
+  const posId = normalizeTraccarPositionId(traccar_position_id);
+  if (posId != null) doc.traccar_position_id = posId;
   return doc;
 }
 
@@ -201,5 +206,6 @@ module.exports = {
   setGpsPointWriter,
   getGpsPointWriter,
   backfillGpsPointsFromLogs,
+  normalizeTraccarPositionId,
   ATTR_TYPE_SKIP,
 };
