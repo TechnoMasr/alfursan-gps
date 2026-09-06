@@ -232,8 +232,13 @@ async function warmImeiToRoomCacheFromMongo() {
   try {
     const coll = mongoose.connection.collection("device_details");
     const cursor = coll.find(
-      { tenant_id: { $exists: true, $ne: null } },
-      { projection: { imei: 1, serial_number: 1, tenant_id: 1 } }
+      {
+        $or: [
+          { tenant_id: { $exists: true, $ne: null } },
+          { device_owner_id: { $exists: true, $ne: null } },
+        ],
+      },
+      { projection: { imei: 1, serial_number: 1, tenant_id: 1, device_owner_id: 1 } }
     );
     const docs =
       cursor && typeof cursor.toArray === "function"
@@ -243,7 +248,7 @@ async function warmImeiToRoomCacheFromMongo() {
           : [];
     let count = 0;
     for await (const doc of docs) {
-      const tenantId = normalizeTenantId(doc.tenant_id);
+      const tenantId = normalizeTenantId(doc.tenant_id ?? doc.device_owner_id);
       if (!tenantId) continue;
       const roomName = buildTenantRoomName(tenantId);
       const keys = [doc.imei, doc.serial_number].filter(Boolean).map(String);
@@ -513,13 +518,13 @@ async function resolveTenantRoomByImei(imei) {
   try {
     const deviceDetails = await mongoose.connection.collection("device_details").findOne(
       { $or: [{ imei: key }, { serial_number: key }] },
-      { projection: { tenant_id: 1, tenant_db_name: 1, imei: 1 } }
+      { projection: { tenant_id: 1, device_owner_id: 1, tenant_db_name: 1, imei: 1 } }
     );
 
     if (!deviceDetails) {
       reason = "not_in_device_details";
     } else {
-      const tenantId = normalizeTenantId(deviceDetails.tenant_id);
+      const tenantId = normalizeTenantId(deviceDetails.tenant_id ?? deviceDetails.device_owner_id);
       if (tenantId) {
         roomName = buildTenantRoomName(tenantId);
       } else if (deviceDetails.tenant_db_name) {
@@ -2509,6 +2514,13 @@ function persistPositionBody(imei, position, rawPayload, options = {}) {
     rssi: attrs?.rssi ?? null,
     alarm: attrs?.alarm ?? null,
     type: attrs?.type ?? null,
+    sat: attrs?.sat ?? null,
+    pdop: attrs?.pdop ?? null,
+    hdop: attrs?.hdop ?? null,
+    status: attrs?.status ?? null,
+    hours: attrs?.hours ?? null,
+    distance: attrs?.distance ?? null,
+    totalDistance: attrs?.totalDistance ?? null,
   };
   const persistenceDoc = {
     imei: doc.imei,
@@ -2528,6 +2540,10 @@ function persistPositionBody(imei, position, rawPayload, options = {}) {
     ignition: typeof attrs?.ignition === "boolean" ? attrs.ignition : null,
     distanceDiff,
     traccar_position_id: doc.traccar_position_id,
+    protocol: position?.protocol || null,
+    deviceId: position?.deviceId ?? null,
+    valid: !!position?.valid,
+    deviceStatus: position?.deviceStatus ?? null,
     gps: hasValidCoords
       ? {
           latitude,
