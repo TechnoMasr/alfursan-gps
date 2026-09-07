@@ -2,7 +2,7 @@
 
 **Source of truth for AI agents.** Prefer CURRENT HEAD over old Grok/Codex audit reports.
 
-Last updated: 2026-09-07 — **FINAL REPORTING / ANALYTICS STABILIZATION CLOSED**
+Last updated: 2026-09-07 — **Traccar memory-mode device registry + command path hardening**
 
 ---
 
@@ -177,9 +177,24 @@ Do **not** PM2-cluster the entire WebSocket application. Do **not** introduce Re
 
 ## Authoritative identity
 
-- Permanent identity: **IMEI == Traccar `uniqueId`**
-- Traccar numeric `device.id` is runtime-only (memory mode)
+- Permanent identity: **IMEI == Traccar `uniqueId`** (string; trim only — never `Number()`)
+- Traccar numeric `device.id` is **ephemeral / runtime-only** (memory mode). It changes across Traccar restarts / memory rebuilds. Never use it as application identity or as a durable Mongo key for commands.
 - Traccar `position.id` may be `0` — never use as persistent identity or retry fingerprint
+
+### Traccar memory-mode device registry (Node)
+
+- Config: `database.memory=true`, `database.registerUnknown=true` — Mongo/Node remain SoR; no Traccar SQL.
+- **Approved production Traccar version: 6.12.2**
+  - 6.13.2 + memory mode: repeatable `ConcurrentModificationException` in `CommandsManager.sendCommand` / `Storage.getObject` on `POST /api/commands/send`
+  - 6.12.2 verified: `/api/devices?all=true`, custom command HTTP 200, tracker replied
+- Authoritative fleet enumeration for service-token auth: **`GET /api/devices?all=true`**
+  - Plain `GET /api/devices` and `GET /api/devices?uniqueId=IMEI` return `[]` under this integration — do **not** use them for startup reconciliation or command lookup
+- In-process registry: `lib/traccarDeviceRegistry.js` — maps `uniqueId → current device`, refresh via `DEVICES_POLL_MS` (default 15m), single in-flight refresh, failed refresh preserves last good snapshot
+- Commands: resolve IMEI → runtime `deviceId` from registry; on stale-id failure refresh once and retry **only if** runtime id changed (never CME retry loops)
+- Model sync continues lifecycle-based; uses current registry/runtime id (re-sync when runtime id changes)
+- Startup empty-snapshot safety: `TRACCAR_REGISTRY_STARTUP_GRACE_MS` (default 120s) defers mass-offline on valid `[]` while devices re-register; after grace require two consecutive empty snapshots before treating fleet as absent
+
+Legacy Mongo fields such as `last_device_id` / `traccar_runtime_device_id` may remain for diagnostics — Node must not trust them after Traccar restart.
 
 ---
 
@@ -331,17 +346,17 @@ Hot path after resolution: **Map lookup only** — no Mongo, no Traccar HTTP, no
 | Case | Behavior |
 |------|----------|
 | First see IMEI | Resolve `device_details.tr_model` (fallback `devicestatuses`) **once** |
-| `tr_model` missing | `no_model` negative cache (default **10 min**); log **once**; later packets silent |
-| Negative TTL expiry | One re-lookup; if still missing, stay quiet (no repeated `skipped: no tr_model`) |
-| Synced + matching model | Silent |
+| Explicit non-empty `tr_model` | Sync that model to current Traccar runtime device id |
+| `tr_model` missing / null / blank | Effective desired model = **`Seeworld`** (runtime fallback; **do not** write back to Mongo); sync normally — **not** `no_model` |
+| Synced + matching model | Silent Map hit |
 | Forwarded `model=null` after Traccar restart | Invalidate runtime sync; re-PUT using **cached desired model** (no Mongo if positive cache warm) |
-| Runtime device id changes | New runtime lifecycle; re-sync once with cached desired model |
+| Runtime device id changes | New runtime lifecycle; re-sync once with cached desired model (incl. Seeworld fallback) |
 | `MODEL_A`→`MODEL_B` | Positive metadata TTL refresh, then one sync |
 
-Defaults: `TRACCAR_MODEL_NEGATIVE_CACHE_TTL_MS=600000`, `TRACCAR_MODEL_CACHE_TTL_MS=300000`.  
+Defaults: `TRACCAR_MODEL_CACHE_TTL_MS=300000`. (`TRACCAR_MODEL_NEGATIVE_CACHE_TTL_MS` retained for env compatibility; blank Mongo no longer uses negative/no_model skip.)  
 Debug: `TRACCAR_MODEL_SYNC_DEBUG_IMEI`. Invalidate: `traccarModelSync.invalidate(imei)`.
 
-Metrics: `requested` / `skipped_no_model` count **resolution/sync work**, not every GPS packet.
+Metrics: `requested` / `explicit` / `default_seeworld` / success counters count **resolution/sync work**, not every GPS packet.
 
 ---
 

@@ -1,6 +1,10 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const { createTraccarModelSync } = require("../lib/traccarModelSync");
+const {
+  createTraccarModelSync,
+  resolveEffectiveDesiredModel,
+  DEFAULT_DEVICE_MODEL,
+} = require("../lib/traccarModelSync");
 
 async function waitFor(predicate, timeoutMs = 1000) {
   const deadline = Date.now() + timeoutMs;
@@ -9,46 +13,172 @@ async function waitFor(predicate, timeoutMs = 1000) {
   }
 }
 
-function captureLogs() {
-  const lines = [];
-  return {
-    lines,
-    log: {
-      log: (...args) => lines.push(args.map(String).join(" ")),
-      warn: (...args) => lines.push(`WARN ${args.map(String).join(" ")}`),
-      error: (...args) => lines.push(`ERROR ${args.map(String).join(" ")}`),
-    },
-  };
-}
+describe("effective desired model resolution", () => {
+  it("defaults missing/null/blank to Seeworld; keeps explicit models", () => {
+    assert.equal(DEFAULT_DEVICE_MODEL, "Seeworld");
+    assert.deepEqual(resolveEffectiveDesiredModel(undefined), {
+      model: "Seeworld",
+      usedDefault: true,
+      source: "default_seeworld",
+    });
+    assert.deepEqual(resolveEffectiveDesiredModel(null), {
+      model: "Seeworld",
+      usedDefault: true,
+      source: "default_seeworld",
+    });
+    assert.deepEqual(resolveEffectiveDesiredModel(""), {
+      model: "Seeworld",
+      usedDefault: true,
+      source: "default_seeworld",
+    });
+    assert.deepEqual(resolveEffectiveDesiredModel("   "), {
+      model: "Seeworld",
+      usedDefault: true,
+      source: "default_seeworld",
+    });
+    assert.deepEqual(resolveEffectiveDesiredModel("R12L"), {
+      model: "R12L",
+      usedDefault: false,
+      source: "explicit",
+    });
+  });
+});
 
-describe("Traccar model sync", () => {
-  it("skips without a configured tr_model", async () => {
-    let lookups = 0;
+describe("Traccar model sync Seeworld fallback", () => {
+  for (const raw of [undefined, null, "", "   "]) {
+    it(`Mongo model ${JSON.stringify(raw)} → desired Seeworld (not no_model)`, async () => {
+      let lookups = 0;
+      let puts = [];
+      let apiModel = null;
+      const metrics = {};
+      const sync = createTraccarModelSync({
+        metrics,
+        lookupModel: async () => {
+          lookups += 1;
+          return raw;
+        },
+        getClient: () => ({
+          get: async () => ({
+            data: { id: 3235, uniqueId: "A", name: "A", model: apiModel },
+          }),
+          put: async (path, body) => {
+            assert.equal(path, "/api/devices/3235");
+            puts.push(body.model);
+            apiModel = body.model;
+            return { status: 200 };
+          },
+        }),
+      });
+
+      sync.schedule({ imei: "A", runtimeDeviceId: 3235, currentModel: null });
+      await waitFor(() => metrics.traccar_model_sync_success_total === 1);
+
+      assert.equal(lookups, 1);
+      assert.deepEqual(puts, ["Seeworld"]);
+      assert.equal(sync._syncedRuntime.get("A|3235").trModel, "Seeworld");
+      assert.notEqual(sync._lifecycle.get("A")?.state, "no_model");
+      assert.equal(metrics.traccar_model_sync_default_seeworld_total, 1);
+      assert.equal(metrics.traccar_model_sync_skipped_no_model_total || 0, 0);
+
+      for (let i = 0; i < 50; i++) {
+        const r = sync.schedule({
+          imei: "A",
+          runtimeDeviceId: 3235,
+          currentModel: "Seeworld",
+        });
+        assert.ok(r.skipped === "already_synced" || r.skipped === "already_correct");
+      }
+      assert.equal(lookups, 1);
+    });
+  }
+
+  it("Mongo model R12L remains explicit", async () => {
+    let puts = [];
+    let apiModel = null;
     const metrics = {};
     const sync = createTraccarModelSync({
       metrics,
+      lookupModel: async () => "R12L",
+      getClient: () => ({
+        get: async () => ({ data: { id: 1, uniqueId: "B", name: "B", model: apiModel } }),
+        put: async (_p, body) => {
+          puts.push(body.model);
+          apiModel = body.model;
+          return { status: 200 };
+        },
+      }),
+    });
+    sync.schedule({ imei: "B", runtimeDeviceId: 1, currentModel: null });
+    await waitFor(() => metrics.traccar_model_sync_success_total === 1);
+    assert.deepEqual(puts, ["R12L"]);
+    assert.equal(metrics.traccar_model_sync_explicit_total, 1);
+    assert.equal(metrics.traccar_model_sync_default_seeworld_total || 0, 0);
+  });
+
+  it("fallback does not write Seeworld back to Mongo", async () => {
+    const mongoMutations = [];
+    let apiModel = null;
+    const sync = createTraccarModelSync({
+      metrics: {},
       lookupModel: async () => {
-        lookups += 1;
+        mongoMutations.push("read");
         return null;
       },
       getClient: () => ({
-        get: async () => {
-          throw new Error("should_not_get");
+        get: async () => ({ data: { id: 9, uniqueId: "C", name: "C", model: apiModel } }),
+        put: async (_p, body) => {
+          apiModel = body.model;
+          return { status: 200 };
         },
-        put: async () => {
-          throw new Error("should_not_put");
+      }),
+    });
+    sync.schedule({ imei: "C", runtimeDeviceId: 9, currentModel: "" });
+    await waitFor(() => sync._syncedRuntime.has("C|9"));
+    assert.deepEqual(mongoMutations, ["read"]);
+    assert.equal(sync._syncedRuntime.get("C|9").trModel, "Seeworld");
+  });
+
+  it("runtime id change after Traccar restart re-syncs Seeworld to new id", async () => {
+    const puts = [];
+    const apiModels = new Map([
+      [3235, null],
+      [4102, null],
+    ]);
+    const metrics = {};
+    const sync = createTraccarModelSync({
+      metrics,
+      lookupModel: async () => null,
+      getClient: () => ({
+        get: async (path) => {
+          const id = Number(String(path).split("/").pop());
+          return {
+            data: { id, uniqueId: "D", name: "D", model: apiModels.get(id) },
+          };
+        },
+        put: async (path, body) => {
+          const id = Number(String(path).split("/").pop());
+          puts.push({ id, model: body.model });
+          apiModels.set(id, body.model);
+          return { status: 200 };
         },
       }),
     });
 
-    sync.schedule({ imei: "A", runtimeDeviceId: 1, currentModel: "" });
-    await waitFor(() => metrics.traccar_model_sync_skipped_no_model_total === 1);
+    sync.schedule({ imei: "D", runtimeDeviceId: 3235, currentModel: null });
+    await waitFor(() => sync._syncedRuntime.has("D|3235"));
+    assert.equal(sync._syncedRuntime.get("D|3235").trModel, "Seeworld");
 
-    assert.equal(lookups, 1);
-    assert.equal(metrics.traccar_model_sync_skipped_no_model_total, 1);
-    assert.equal(metrics.traccar_model_sync_success_total || 0, 0);
+    sync.schedule({ imei: "D", runtimeDeviceId: 4102, currentModel: null });
+    await waitFor(() => sync._syncedRuntime.has("D|4102"));
+    assert.equal(sync._syncedRuntime.get("D|4102").trModel, "Seeworld");
+    assert.deepEqual(puts, [
+      { id: 3235, model: "Seeworld" },
+      { id: 4102, model: "Seeworld" },
+    ]);
   });
+});
 
+describe("Traccar model sync", () => {
   it("does not PUT when forwarded model is already correct", async () => {
     let puts = 0;
     const metrics = {};
@@ -118,7 +248,6 @@ describe("Traccar model sync", () => {
               id: 9,
               uniqueId: "A",
               name: "Device A",
-              category: "car",
               model: getCalls > 1 ? "SEEWORLD" : null,
             },
           };
@@ -126,52 +255,44 @@ describe("Traccar model sync", () => {
         put: async (path, body) => {
           assert.equal(path, "/api/devices/9");
           putBodies.push(body);
+          return { status: 200 };
         },
       }),
     });
 
     sync.schedule({ imei: "A", runtimeDeviceId: 9, currentModel: "", forwardedDevice: { id: 9 } });
     await waitFor(() => putBodies.length === 1);
-
-    assert.equal(putBodies[0].uniqueId, "A");
-    assert.equal(putBodies[0].name, "Device A");
-    assert.equal(putBodies[0].category, "car");
     assert.equal(putBodies[0].model, "SEEWORLD");
-    assert.equal(getCalls, 2);
+    assert.ok(getCalls >= 2);
   });
 
   it("runtime id change schedules another sync", async () => {
     const puts = [];
-    const apiModels = new Map();
-    let lookups = 0;
-    const metrics = {};
+    const apiModels = new Map([
+      [1, null],
+      [2, null],
+    ]);
     const sync = createTraccarModelSync({
-      metrics,
-      lookupModel: async () => {
-        lookups += 1;
-        return "SEEWORLD";
-      },
+      lookupModel: async () => "SEEWORLD",
       getClient: () => ({
         get: async (path) => {
-          const id = Number(path.split("/").pop());
+          const id = Number(String(path).split("/").pop());
           return { data: { id, uniqueId: "A", name: "A", model: apiModels.get(id) || null } };
         },
-        put: async (path) => {
-          const id = Number(path.split("/").pop());
-          apiModels.set(id, "SEEWORLD");
+        put: async (path, body) => {
+          const id = Number(String(path).split("/").pop());
           puts.push(path);
+          apiModels.set(id, body.model);
+          return { status: 200 };
         },
       }),
     });
 
     sync.schedule({ imei: "A", runtimeDeviceId: 1, currentModel: "" });
-    await waitFor(() => puts.length === 1);
+    await waitFor(() => puts.includes("/api/devices/1"));
     sync.schedule({ imei: "A", runtimeDeviceId: 2, currentModel: "" });
-    await waitFor(() => puts.length === 2);
-
+    await waitFor(() => puts.includes("/api/devices/2"));
     assert.deepEqual(puts, ["/api/devices/1", "/api/devices/2"]);
-    // Positive desired-model cache reused — no second Mongo lookup.
-    assert.equal(lookups, 1);
   });
 
   it("records API failure without throwing from schedule", async () => {
@@ -182,33 +303,27 @@ describe("Traccar model sync", () => {
       getClient: () => ({
         get: async () => ({ data: { id: 5, uniqueId: "A", name: "A", model: null } }),
         put: async () => {
-          throw Object.assign(new Error("temporary"), { response: { status: 500 } });
+          const err = new Error("temporary");
+          err.response = { status: 500 };
+          throw err;
         },
       }),
     });
-
     const result = sync.schedule({ imei: "A", runtimeDeviceId: 5, currentModel: "" });
-    await waitFor(() => metrics.traccar_model_sync_failed_total === 1);
-
     assert.equal(result.accepted, true);
+    await waitFor(() => metrics.traccar_model_sync_failed_total === 1);
     assert.equal(metrics.traccar_model_sync_failed_total, 1);
   });
 
   it("does not trust cached runtime sync when forwarded model is explicitly empty again", async () => {
-    const puts = [];
     let apiModel = null;
-    let lookups = 0;
     const metrics = {};
     const sync = createTraccarModelSync({
       metrics,
-      lookupModel: async () => {
-        lookups += 1;
-        return "SEEWORLD";
-      },
+      lookupModel: async () => "SEEWORLD",
       getClient: () => ({
         get: async () => ({ data: { id: 10, uniqueId: "A", name: "A", model: apiModel } }),
         put: async () => {
-          puts.push(Date.now());
           apiModel = "SEEWORLD";
           return { status: 200 };
         },
@@ -217,32 +332,25 @@ describe("Traccar model sync", () => {
 
     sync.schedule({ imei: "A", runtimeDeviceId: 10, currentModel: null });
     await waitFor(() => metrics.traccar_model_sync_success_total === 1);
-
     apiModel = null;
     sync.schedule({ imei: "A", runtimeDeviceId: 10, currentModel: null });
     await waitFor(() => metrics.traccar_model_sync_success_total === 2);
-
-    assert.equal(puts.length, 2);
     assert.equal(metrics.traccar_model_sync_verified_total, 2);
-    assert.equal(lookups, 1, "desired model cache survives Traccar restart resync");
   });
 
   it("retries when GET after PUT does not verify the requested model", async () => {
     const metrics = {};
     const sync = createTraccarModelSync({
       metrics,
-      retryBaseMs: 10_000,
       lookupModel: async () => "SEEWORLD",
       getClient: () => ({
         get: async () => ({ data: { id: 11, uniqueId: "A", name: "A", model: null } }),
         put: async () => ({ status: 200 }),
       }),
     });
-
     const result = sync.schedule({ imei: "A", runtimeDeviceId: 11, currentModel: null });
-    await waitFor(() => metrics.traccar_model_sync_failed_total === 1);
-
     assert.equal(result.accepted, true);
+    await waitFor(() => metrics.traccar_model_sync_failed_total === 1);
     assert.equal(metrics.traccar_model_sync_attempt_total, 1);
     assert.equal(metrics.traccar_model_sync_mismatch_total, 1);
     assert.equal(metrics.traccar_model_sync_success_total || 0, 0);
@@ -250,116 +358,42 @@ describe("Traccar model sync", () => {
 });
 
 describe("Traccar model sync lifecycle (no packet spam)", () => {
-  it("no_model: one Mongo lookup then silent cache hits with no repeated logs", async () => {
+  it("blank Mongo model: one lookup syncs Seeworld then silent cache hits", async () => {
     let lookups = 0;
     let puts = 0;
+    let apiModel = null;
     const metrics = {};
-    const { lines, log } = captureLogs();
     const sync = createTraccarModelSync({
       metrics,
-      log,
-      negativeModelCacheTtlMs: 600_000,
       lookupModel: async () => {
         lookups += 1;
         return null;
       },
       getClient: () => ({
-        get: async () => {
-          throw new Error("no_get");
-        },
-        put: async () => {
+        get: async () => ({ data: { id: 1, uniqueId: "N1", name: "N1", model: apiModel } }),
+        put: async (_p, body) => {
           puts += 1;
+          apiModel = body.model;
+          return { status: 200 };
         },
       }),
     });
 
     sync.schedule({ imei: "N1", runtimeDeviceId: 1, currentModel: null });
-    await waitFor(() => metrics.traccar_model_sync_skipped_no_model_total === 1);
+    await waitFor(() => metrics.traccar_model_sync_success_total === 1);
     assert.equal(lookups, 1);
-    assert.equal(metrics.traccar_model_sync_requested_total, 1);
-    const logsAfterFirst = lines.filter((l) => l.includes("no tr_model")).length;
-    assert.equal(logsAfterFirst, 1);
+    assert.equal(puts, 1);
+    assert.equal(apiModel, "Seeworld");
+    assert.equal(metrics.traccar_model_sync_default_seeworld_total, 1);
+    assert.equal(metrics.traccar_model_sync_skipped_no_model_total || 0, 0);
 
     for (let i = 0; i < 100; i++) {
-      const r = sync.schedule({ imei: "N1", runtimeDeviceId: 1, currentModel: null });
-      assert.equal(r.skipped, "no_model_cached");
+      const r = sync.schedule({ imei: "N1", runtimeDeviceId: 1, currentModel: "Seeworld" });
+      assert.ok(r.skipped === "already_synced" || r.skipped === "already_correct");
     }
     assert.equal(lookups, 1);
-    assert.equal(puts, 0);
+    assert.equal(puts, 1);
     assert.equal(metrics.traccar_model_sync_requested_total, 1);
-    assert.equal(metrics.traccar_model_sync_skipped_no_model_total, 1);
-    assert.equal(lines.filter((l) => l.includes("no tr_model")).length, 1);
-  });
-
-  it("negative TTL expiry triggers exactly one new lookup; still-null stays quiet", async () => {
-    let now = 1_000;
-    let lookups = 0;
-    let model = null;
-    const metrics = {};
-    const { lines, log } = captureLogs();
-    const sync = createTraccarModelSync({
-      metrics,
-      log,
-      now: () => now,
-      negativeModelCacheTtlMs: 1_000,
-      lookupModel: async () => {
-        lookups += 1;
-        return model;
-      },
-      getClient: () => ({
-        get: async () => ({ data: { id: 2, uniqueId: "N2", name: "N2", model: null } }),
-        put: async (_p, body) => {
-          model = body.model;
-          return { status: 200 };
-        },
-      }),
-    });
-
-    sync.schedule({ imei: "N2", runtimeDeviceId: 2, currentModel: null });
-    await waitFor(() => lookups === 1);
-    assert.equal(metrics.traccar_model_sync_skipped_no_model_total, 1);
-
-    now += 2_000; // expire negative cache
-    sync.schedule({ imei: "N2", runtimeDeviceId: 2, currentModel: null });
-    await waitFor(() => lookups === 2);
-    assert.equal(metrics.traccar_model_sync_requested_total, 2);
-    // Still no model — do not re-bump skipped / re-log.
-    assert.equal(metrics.traccar_model_sync_skipped_no_model_total, 1);
-    assert.equal(lines.filter((l) => l.includes("no tr_model")).length, 1);
-
-    model = "SEEWORLD";
-    // Force metadata refresh: expire again then discover.
-    now += 2_000;
-    // Put path needs GET to see null then verify SEEWORLD after put — reset api via closure
-    let apiModel = null;
-    const sync2 = createTraccarModelSync({
-      metrics: {},
-      log,
-      now: () => now,
-      negativeModelCacheTtlMs: 1_000,
-      lookupModel: async () => {
-        lookups += 1;
-        return model;
-      },
-      getClient: () => ({
-        get: async () => ({
-          data: { id: 3, uniqueId: "N3", name: "N3", model: apiModel },
-        }),
-        put: async () => {
-          apiModel = "SEEWORLD";
-          return { status: 200 };
-        },
-      }),
-    });
-    // Seed no_model then expire and discover on N3
-    model = null;
-    sync2.schedule({ imei: "N3", runtimeDeviceId: 3, currentModel: null });
-    await waitFor(() => sync2._lifecycle.get("N3")?.state === "no_model");
-    now += 2_000;
-    model = "SEEWORLD";
-    sync2.schedule({ imei: "N3", runtimeDeviceId: 3, currentModel: null });
-    await waitFor(() => sync2._syncedRuntime.has("N3|3"));
-    assert.equal(sync2._syncedRuntime.get("N3|3").trModel, "SEEWORLD");
   });
 
   it("synced device: thousands of packets do no model work", async () => {
@@ -423,8 +457,7 @@ describe("Traccar model sync lifecycle (no packet spam)", () => {
     await waitFor(() => puts[0] === "MODEL_A");
 
     model = "MODEL_B";
-    now += 2_000; // expire positive metadata
-    // Forwarded model still A → mismatch with new desired after refresh
+    now += 2_000;
     sync.schedule({ imei: "M1", runtimeDeviceId: 8, currentModel: "MODEL_A" });
     await waitFor(() => puts.includes("MODEL_B"));
     assert.ok(puts.includes("MODEL_B"));

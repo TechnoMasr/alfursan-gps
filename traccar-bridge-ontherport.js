@@ -42,13 +42,17 @@ const {
 } = require("./lib/traccarRawIngressWriter");
 const { createForwardRetryDedupe } = require("./lib/forwardRetryDedupe");
 const { handleTraccarForwardPosition } = require("./lib/handleTraccarForwardPosition");
-const { resolveRuntimeDeviceIdByImei: resolveRuntimeDeviceIdByImeiViaTraccar } = require("./lib/traccarRuntimeDevices");
+const {
+  resolveRuntimeDeviceIdByImei: resolveRuntimeDeviceIdByImeiViaTraccar,
+  createTraccarDeviceRegistry,
+  sendTraccarCustomCommand,
+} = require("./lib/traccarRuntimeDevices");
 const { maybeLatencyLog } = require("./lib/latencyLog");
 const { createEventLoopLagMonitor } = require("./lib/eventLoopLag");
 const { createImeiDebugger } = require("./lib/imeiDebug");
 const { countSubscriberMetrics } = require("./lib/subscriberCounts");
 const { createTenantRoomGpsThrottle } = require("./lib/tenantRoomGpsThrottle");
-const { runStartupConnectivityReconciliation } = require("./lib/startupConnectivityReconciliation");
+const { createStartupConnectivityReconciler } = require("./lib/startupConnectivityReconciliation");
 const { createTraccarModelSync } = require("./lib/traccarModelSync");
 const {
   verifyForwardBearer,
@@ -85,6 +89,9 @@ const TRACCAR_SERVICE_TOKEN = String(BRIDGE_ENV.TRACCAR_SERVICE_TOKEN || "").tri
 const TRACCAR_FORWARD_TOKEN = String(BRIDGE_ENV.TRACCAR_FORWARD_TOKEN || "").trim();
 const BASE_GAP_MIN = BRIDGE_ENV.BASE_GAP_MIN;
 const DEVICE_FETCH_COOLDOWN_MS = BRIDGE_ENV.DEVICE_FETCH_COOLDOWN_MS;
+const DEVICES_POLL_MS = BRIDGE_ENV.DEVICES_POLL_MS;
+const TRACCAR_REGISTRY_STARTUP_GRACE_MS = BRIDGE_ENV.TRACCAR_REGISTRY_STARTUP_GRACE_MS;
+const TRACCAR_REGISTRY_RECONCILE_RETRY_MS = BRIDGE_ENV.TRACCAR_REGISTRY_RECONCILE_RETRY_MS;
 const MAX_LIVE_FIX_AGE_MS = BRIDGE_ENV.MAX_LIVE_FIX_AGE_MS;
 const LIVE_FIX_FUTURE_TOLERANCE_MS = BRIDGE_ENV.LIVE_FIX_FUTURE_TOLERANCE_MS;
 const LIVE_DEVICE_TIME_FALLBACK = BRIDGE_ENV.LIVE_DEVICE_TIME_FALLBACK;
@@ -289,6 +296,7 @@ async function warmImeiToRoomCacheFromMongo() {
 }
 let subscribersServerStarted = false;
 let traccarHttpClient = null;
+let traccarDeviceRegistry = null;
 let traccarModelSync = null;
 let persistPositionHeavyRef = async () => {};
 const analyticsQueue = {
@@ -907,6 +915,13 @@ function startSubscribersServer() {
     Object.assign(bridgeMetrics, counts);
     bridgeMetrics.traccar_ingress = "http-forward";
     bridgeMetrics.forward_queue_depth = forwardQueue.getDepth();
+    if (traccarDeviceRegistry) {
+      const reg = traccarDeviceRegistry.getStatus();
+      bridgeMetrics.traccar_registry_devices = reg.devices;
+      bridgeMetrics.traccar_registry_last_refresh_at = reg.last_refresh_at;
+      bridgeMetrics.traccar_registry_refresh_age_ms = reg.refresh_age_ms || 0;
+      bridgeMetrics.traccar_registry_last_snapshot_empty = Boolean(reg.last_snapshot_empty);
+    }
     Object.assign(bridgeMetrics, rawIngressWriter.getStats());
     const localWriterStats = gpsPointWriter.getStats();
     const externalWriterHb = readGpspointsWriterHeartbeat(
@@ -1069,6 +1084,35 @@ function startSubscribersServer() {
       startup_reconciliation_mongo_online: bridgeMetrics.startup_reconciliation_mongo_online || 0,
       startup_reconciliation_marked_offline: bridgeMetrics.startup_reconciliation_marked_offline || 0,
       startup_reconciliation_failures: bridgeMetrics.startup_reconciliation_failures || 0,
+      startup_reconciliation_traccar_api_failure_total:
+        bridgeMetrics.startup_reconciliation_traccar_api_failure_total || 0,
+      startup_reconciliation_traccar_snapshot_empty_total:
+        bridgeMetrics.startup_reconciliation_traccar_snapshot_empty_total || 0,
+      startup_reconciliation_mass_offline_skipped:
+        bridgeMetrics.startup_reconciliation_mass_offline_skipped || 0,
+      startup_reconciliation_empty_deferred_total:
+        bridgeMetrics.startup_reconciliation_empty_deferred_total || 0,
+      startup_reconciliation_empty_confirmed_total:
+        bridgeMetrics.startup_reconciliation_empty_confirmed_total || 0,
+      startup_reconciliation_grace_active: bridgeMetrics.startup_reconciliation_grace_active || 0,
+      traccar_registry_devices: bridgeMetrics.traccar_registry_devices || 0,
+      traccar_registry_last_refresh_at: bridgeMetrics.traccar_registry_last_refresh_at || null,
+      traccar_registry_refresh_age_ms: bridgeMetrics.traccar_registry_refresh_age_ms || 0,
+      traccar_registry_refresh_success_total: bridgeMetrics.traccar_registry_refresh_success_total || 0,
+      traccar_registry_refresh_failure_total: bridgeMetrics.traccar_registry_refresh_failure_total || 0,
+      traccar_registry_cache_hit_total: bridgeMetrics.traccar_registry_cache_hit_total || 0,
+      traccar_registry_cache_miss_total: bridgeMetrics.traccar_registry_cache_miss_total || 0,
+      traccar_registry_forced_refresh_total: bridgeMetrics.traccar_registry_forced_refresh_total || 0,
+      traccar_registry_runtime_id_change_total:
+        bridgeMetrics.traccar_registry_runtime_id_change_total || 0,
+      traccar_registry_last_snapshot_empty: bridgeMetrics.traccar_registry_last_snapshot_empty || false,
+      traccar_command_send_total: bridgeMetrics.traccar_command_send_total || 0,
+      traccar_command_send_success_total: bridgeMetrics.traccar_command_send_success_total || 0,
+      traccar_command_send_failure_total: bridgeMetrics.traccar_command_send_failure_total || 0,
+      traccar_command_stale_id_retry_total: bridgeMetrics.traccar_command_stale_id_retry_total || 0,
+      traccar_command_stale_id_retry_success_total:
+        bridgeMetrics.traccar_command_stale_id_retry_success_total || 0,
+      traccar_command_cme_total: bridgeMetrics.traccar_command_cme_total || 0,
       traccar_model_sync_requested_total: bridgeMetrics.traccar_model_sync_requested_total || 0,
       traccar_model_sync_success_total: bridgeMetrics.traccar_model_sync_success_total || 0,
       traccar_model_sync_failed_total: bridgeMetrics.traccar_model_sync_failed_total || 0,
@@ -1082,6 +1126,9 @@ function startSubscribersServer() {
       traccar_model_cache_size: bridgeMetrics.traccar_model_cache_size || 0,
       traccar_model_no_model_cache_size: bridgeMetrics.traccar_model_no_model_cache_size || 0,
       traccar_model_sync_last_success_at: bridgeMetrics.traccar_model_sync_last_success_at || null,
+      traccar_model_sync_explicit_total: bridgeMetrics.traccar_model_sync_explicit_total || 0,
+      traccar_model_sync_default_seeworld_total:
+        bridgeMetrics.traccar_model_sync_default_seeworld_total || 0,
       traccar_power_seen_total: bridgeMetrics.traccar_power_seen_total || 0,
       persistence_health: persistenceHealth,
       gpspoint_spool_dir: writerStats.gpspoint_spool_dir,
@@ -1378,14 +1425,18 @@ function startSubscribersServer() {
       if (!traccarHttpClient) {
         return res.status(503).send("âŒ Traccar REST client is not ready");
       }
+      if (!traccarDeviceRegistry) {
+        return res.status(503).send("âŒ Traccar device registry is not ready");
+      }
 
-      const targetDeviceId = await resolveRuntimeDeviceIdByImei(payloadImei);
-
-      await traccarHttpClient.post("/api/commands/send", {
-        type: "custom",
-        attributes: { data: payloadCommand , noQueue: true },
-        deviceId: targetDeviceId,
+      const sendResult = await sendTraccarCustomCommand({
+        registry: traccarDeviceRegistry,
+        client: traccarHttpClient,
+        metrics: bridgeMetrics,
+        imei: payloadImei,
+        command: payloadCommand,
       });
+      const targetDeviceId = sendResult.runtimeId;
 
       const cmdArTitle = String(arTitle || "").trim() || `تم إرسال أمر إلى الجهاز ${payloadImei}`;
       const cmdEnTitle = String(enTitle || "").trim() || `Command sent to device ${payloadImei}`;
@@ -1819,10 +1870,19 @@ async function resolveImei(deviceId) {
 }
 
 async function resolveRuntimeDeviceIdByImei(imei) {
+  if (traccarDeviceRegistry) {
+    return resolveRuntimeDeviceIdByImeiViaTraccar({
+      registry: traccarDeviceRegistry,
+      imei,
+      cache: deviceIdToImeiCache,
+      metrics: bridgeMetrics,
+    });
+  }
   return resolveRuntimeDeviceIdByImeiViaTraccar({
     client: traccarHttpClient,
     imei,
     cache: deviceIdToImeiCache,
+    metrics: bridgeMetrics,
   });
 }
 
@@ -3003,6 +3063,37 @@ function createTraccarBearerClient() {
 
 async function bootBridge() {
   traccarHttpClient = createTraccarBearerClient();
+  traccarDeviceRegistry = createTraccarDeviceRegistry({
+    getClient: () => traccarHttpClient,
+    metrics: bridgeMetrics,
+    log: console,
+    pollIntervalMs: DEVICES_POLL_MS,
+    cooldownMs: DEVICE_FETCH_COOLDOWN_MS,
+    onSnapshot: (devices, { runtimeIdChanges } = {}) => {
+      for (const device of devices || []) {
+        const imei = device?.uniqueId ? String(device.uniqueId).trim() : "";
+        const runtimeDeviceId = Number(device?.id);
+        if (!imei || !Number.isFinite(runtimeDeviceId)) continue;
+        deviceIdToImeiCache.set(runtimeDeviceId, imei);
+        scheduleTraccarModelSyncForDevice({
+          imei,
+          runtimeDeviceId,
+          currentModel: device?.model,
+          forwardedDevice: device,
+        });
+      }
+      for (const change of runtimeIdChanges || []) {
+        // Ensure model sync sees the new ephemeral runtime id after Traccar restart.
+        scheduleTraccarModelSyncForDevice({
+          imei: change.uniqueId,
+          runtimeDeviceId: change.runtimeId,
+          currentModel: change.device?.model,
+          forwardedDevice: change.device,
+        });
+      }
+    },
+  });
+  traccarDeviceRegistry.startPolling();
   traccarModelSync = createTraccarModelSync({
     getClient: () => traccarHttpClient,
     metrics: bridgeMetrics,
@@ -3018,13 +3109,19 @@ async function bootBridge() {
   console.log("Traccar REST client configured", {
     baseURL: TRACCAR_BASE,
     auth: "bearer",
+    devicesEnumeration: "/api/devices?all=true",
+    approvedTraccarVersion: "6.12.2",
   });
   void warmImeiToRoomCacheFromMongo();
-  void runStartupConnectivityReconciliation({
+  const startupReconciler = createStartupConnectivityReconciler({
+    registry: traccarDeviceRegistry,
     traccarClient: traccarHttpClient,
     metrics: bridgeMetrics,
     log: console,
+    graceMs: TRACCAR_REGISTRY_STARTUP_GRACE_MS,
+    retryIntervalMs: TRACCAR_REGISTRY_RECONCILE_RETRY_MS,
     onTraccarDevices: (devices) => {
+      // Registry onSnapshot already warms caches; keep callback for compatibility / explicit pass.
       for (const device of devices || []) {
         const imei = device?.uniqueId ? String(device.uniqueId).trim() : "";
         const runtimeDeviceId = Number(device?.id);
@@ -3039,6 +3136,7 @@ async function bootBridge() {
       }
     },
   });
+  void startupReconciler.start();
   // Global report materializers: default owner is alfursan-analytics.
   // Rollback: REPORT_SCHEDULER_OWNER=bridge + stop alfursan-analytics (never dual-run).
   const reportOwner = normalizeOwner(

@@ -2,7 +2,7 @@
 
 **Source of truth for AI agents.** Update after every completed phase. CURRENT HEAD > old audit reports.
 
-Last updated: 2026-09-07 — **FINAL REPORTING / ANALYTICS STABILIZATION CLOSED**
+Last updated: 2026-09-07 — **Traccar memory-mode device registry + command path hardening**
 
 ---
 
@@ -328,6 +328,31 @@ Post-P0-A live eligibility ≈0.51, OOO still high. Re-measure after P0-B/E3 dep
 ## FUNCTIONAL — power / model sync
 
 Do not calculate voltage in Node. Model sync is lifecycle-based (ARCHITECTURE.md).
+
+---
+
+## Traccar memory-mode registry + commands — COMPLETE (code + focused tests)
+
+Production discoveries (memory mode + service token):
+
+- Enumerate with **`GET /api/devices?all=true`** only
+- Plain `/api/devices` and `?uniqueId=` returned `[]` → false mass-offline + failed commands
+- Numeric `device.id` is ephemeral across Traccar restarts; IMEI/`uniqueId` is durable
+- **Pin Traccar 6.12.2** for production memory-mode commands (6.13.2 CME in `CommandsManager.sendCommand`)
+
+Node changes:
+
+- `lib/traccarDeviceRegistry.js` — in-process registry, single in-flight refresh, preserve snapshot on API failure
+- Startup reconciliation uses registry; API failure → **no** mass-offline
+- Valid `[]` during `TRACCAR_REGISTRY_STARTUP_GRACE_MS` (default 120s) with Mongo online → **defer** mass-offline and retry
+- After grace: require **two consecutive** successful empty snapshots before mass-offline
+- Valid non-empty snapshot → normal missing-IMEI offline transitions
+- `/send` commands resolve via registry; stale-id → one refresh + retry only if runtime id changed; CME not retry-looped
+- Model sync warm path uses registry snapshot / runtime-id change callback
+- Metrics: `traccar_registry_*`, `traccar_command_*` (no IMEI labels)
+- Focused tests: `test/traccarDeviceRegistry.test.js` (+ updated `traccarForwardIngress` lookup tests)
+
+**Not in this phase:** Traccar SQL, Redis, 8 workers, report schemas, Java patches, push/deploy
 
 ---
 

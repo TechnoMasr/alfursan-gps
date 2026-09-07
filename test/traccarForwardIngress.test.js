@@ -128,7 +128,7 @@ describe("traccar forward ingress adapter", () => {
 });
 
 describe("traccar runtime device command lookup", () => {
-  it("resolves command device id by IMEI with uniqueId query", async () => {
+  it("resolves command device id via all=true registry (not uniqueId query)", async () => {
     const calls = [];
     const cache = new Map();
     const id = await resolveRuntimeDeviceIdByImei({
@@ -143,7 +143,8 @@ describe("traccar runtime device command lookup", () => {
     });
     assert.equal(id, 42);
     assert.equal(calls[0].path, "/api/devices");
-    assert.deepEqual(calls[0].opts.params, { uniqueId: "123" });
+    assert.deepEqual(calls[0].opts.params, { all: true });
+    assert.equal(calls[0].opts.params.uniqueId, undefined);
     assert.equal(cache.get(42), "123");
   });
 
