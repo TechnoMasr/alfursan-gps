@@ -20,7 +20,15 @@ function tmpDir(prefix) {
 function jsonlFiles(dir) {
   return fs
     .readdirSync(dir)
-    .filter((name) => name.endsWith(".jsonl") && !name.endsWith(".tmp"))
+    .filter(
+      (name) =>
+        (name.endsWith(".jsonl") ||
+          name.endsWith(".jsonl.active") ||
+          name.endsWith(".jsonl.ready") ||
+          /\.jsonl\.draining\.\d+$/i.test(name)) &&
+        !name.endsWith(".tmp") &&
+        name !== "quarantine"
+    )
     .map((name) => path.join(dir, name));
 }
 
@@ -286,6 +294,9 @@ describe("durability: disk errors are visible and never silent drops", () => {
         writeFileSync() {
           throw err;
         },
+        appendFileSync() {
+          throw err;
+        },
       }),
       insertMany: async () => {
         throw new Error("mongo down");
@@ -313,6 +324,9 @@ describe("durability: disk errors are visible and never silent drops", () => {
       flushMs: 60_000,
       fsImpl: proxyFs({
         writeFileSync() {
+          throw err;
+        },
+        appendFileSync() {
           throw err;
         },
       }),

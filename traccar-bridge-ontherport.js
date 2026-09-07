@@ -13,6 +13,7 @@ const { GpsPoint, GpsBuffer, CommandResponse, Notification, TraccarIngressRaw } 
 const { normalizeTraccarPositionId } = require("./gpsPointStore");
 const { upsertDeviceStatus } = require("./deviceStatus");
 const { loadBridgeEnv } = require("./lib/bridgeEnv");
+const { readGpspointsWriterHeartbeat } = require("./lib/gpsPointWriter");
 const {
   classifyLiveFix,
   pickLatestLiveFromBurst,
@@ -893,8 +894,12 @@ function startSubscribersServer() {
     bridgeMetrics.forward_queue_depth = forwardQueue.getDepth();
     Object.assign(bridgeMetrics, rawIngressWriter.getStats());
     const localWriterStats = gpsPointWriter.getStats();
+    const externalWriterHb = readGpspointsWriterHeartbeat(
+      BRIDGE_ENV.GPSPOINT_SPOOL_DIR || path.join(__dirname, "data", "gpspoints-spool")
+    );
     const writerStats = {
       ...localWriterStats,
+      ...externalWriterHb,
       gpspoint_spool_dir:
         bridgeMetrics.gpspoint_spool_dir || localWriterStats.gpspoint_spool_dir,
       gpspoints_health:
@@ -957,6 +962,10 @@ function startSubscribersServer() {
       gpspoints_mongo_docs_per_flush_last: bridgeMetrics.gpspoints_mongo_docs_per_flush_last || 0,
       gpspoints_mongo_docs_per_flush_avg: bridgeMetrics.gpspoints_mongo_docs_per_flush_avg || 0,
       gpspoints_mongo_docs_per_flush_max: bridgeMetrics.gpspoints_mongo_docs_per_flush_max || 0,
+      gpspoints_writer_alive: writerStats.gpspoints_writer_alive || false,
+      gpspoints_writer_last_heartbeat: writerStats.gpspoints_writer_last_heartbeat || null,
+      gpspoints_writer_last_persisted_at: writerStats.gpspoints_writer_last_persisted_at || null,
+      gpspoints_writer_heartbeat_age_ms: writerStats.gpspoints_writer_heartbeat_age_ms ?? null,
       startup_reconciliation_last_run_at: bridgeMetrics.startup_reconciliation_last_run_at || null,
       startup_reconciliation_traccar_devices: bridgeMetrics.startup_reconciliation_traccar_devices || 0,
       startup_reconciliation_mongo_online: bridgeMetrics.startup_reconciliation_mongo_online || 0,

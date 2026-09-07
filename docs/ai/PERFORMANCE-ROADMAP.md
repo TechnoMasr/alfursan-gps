@@ -2,7 +2,7 @@
 
 **Source of truth for AI agents.** Update after every completed phase. CURRENT HEAD > old audit reports.
 
-Last updated: 2026-09-07 — **P0-E1 complete; E2 next; E3 dedicated writer committed**
+Last updated: 2026-09-07 — **E1 PRODUCTION VERIFIED; E2+E3 code complete**
 
 ---
 
@@ -30,13 +30,11 @@ Server: 12 vCPU, 31 GB RAM. Node v20, PM2, Mongo localhost, Traccar memory gatew
 
 1. realtime / bridge parent  
 2. raw archive worker  
-3. **gpspoints-writer** (dedicated PM2; **one** instance initially — failure-domain / event-loop isolation)  
-4. **alfursan-analytics** (dedicated PM2; EXACTLY ONE; global schedulers/reports only)  
-5. 8 IMEI-partitioned business/persistence workers (journal + business; **must not** start global schedulers)
+3. **gpspoints-writer** (`alfursan-gpspoints-writer`; one instance; fork)  
+4. **alfursan-analytics** (exactly one; global schedulers only)  
+5. 8 IMEI-partitioned business/persistence workers (journal + business; no global schedulers)
 
-No Redis. No full-app PM2 cluster. Do not create multiple full copies of the whole application.
-
-**Both required:** correct Mongo batching **and** process isolation (CPU, event loops, crashes, Mongo pools, restarts).
+No Redis. No full-app PM2 cluster. Batching **and** process isolation both required.
 
 ---
 
@@ -49,9 +47,9 @@ No Redis. No full-app PM2 cluster. Do not create multiple full copies of the who
 | **P0-B2** | Dedicated raw archive worker | Documented |
 | **P0-C** | Live OOO/stale after retry suppression | After P0-B verify |
 | **P0-D** | Degradation survival | After P0-C |
-| **P0-E1** | Gpspoints: combine legacy files → useful Mongo batches + doc fairness | **COMPLETE (code + focused tests)** |
-| **P0-E2** | Segmented durable journal + legacy reader | **NEXT** |
-| **P0-E3** | Dedicated PM2 `gpspoints-writer` (Mongo drain only) | After E2 — **architectural; not optional long-term** |
+| **P0-E1** | Gpspoints multi-file Mongo combine + doc fairness | **COMPLETE + PRODUCTION VERIFIED** |
+| **P0-E2** | Segmented durable journal + legacy dual-read | **COMPLETE (code + focused tests)** |
+| **P0-E3** | Dedicated PM2 `alfursan-gpspoints-writer` | **COMPLETE (code + focused tests)** |
 | **FUNCTIONAL** | SEEWORLD / tr_model / power E2E | Later |
 | **Phase 2** | Geofence transition-only writes | Later |
 | **Phase 3** | Business queue transition correctness | Later |
@@ -61,21 +59,46 @@ No Redis. No full-app PM2 cluster. Do not create multiple full copies of the who
 
 ---
 
-## P0-E — GPSPoints (committed staged plan)
+## P0-E1 — PRODUCTION VERIFIED
 
-**Root cause (agreed):** tiny per-IPC-batch spool files (~1 doc/file) + **one `insertMany` per file** → ~115k file backlog, `docs_per_flush_avg≈1.19`. Journal/ACK OK; Mongo drain under-batched.
+Immediately after E1 deploy: spool **131,281** files → catch-up Mongo batch avg ~206 / max 250.
 
-| Phase | Scope | Status |
-|-------|--------|--------|
-| **E1** | Multi-file combine → one `insertMany` (250–500); **doc**-based old/new fairness (not 2-new/1-old file slots); raise drain budget; preserve durability + ACK=journal only; **no** format change; **no** PM2 split | **DONE** |
-| **E2** | Segmented journal (`active`→`sealed/ready`→`draining`→done); dual-read legacy until zero | Next |
-| **E3** | Move drain to `gpspoints-writer`; producer journals+ACKs only; own Mongo pool; no WS/business/reports/model-sync/tenant broadcast | After E2 |
+During catch-up (temporary contention): raw durable p99 ~5s; business lag ~1794ms; event-loop p99 ~124ms; IPC ACK max ~2508ms.
 
-Batching targets (configurable, validate in prod): batch 250–500; flush size OR short deadline. At ~22 docs/s today; at 1k docs/s → ~2–4 Mongo batches/s @ 500/250; at 2k → ~4–8/s.
+After several minutes: spool **4** files / 809 bytes / oldest age **79ms**; received 16,038; persisted 169,057; batch avg 51.97 max 250; failures 0; business lag 11ms; event-loop p99 35ms; raw durable p99 6ms.
 
-E1 defaults: `GPSPOINT_BATCH_SIZE=250`, `GPSPOINT_MAX_MONGO_BATCHES_PER_CYCLE=16`, `GPSPOINT_DRAIN_MAX_FILES_PER_CYCLE=500`, `GPSPOINT_DRAIN_OLD_DOC_RATIO=0.5`, `GPSPOINT_JOURNAL_COALESCE_MS=50`.
+Proved: E1 batching works; legacy backlog drains faster than ingest; ~1.19 docs/flush failure fixed; dedicated writer isolation justified. Disk I/O contention can remain at OS level even after process split.
 
-**STOP after E1** until E2 is explicitly started. Do not combine E1/E2/E3 into one rewrite.
+---
+
+## P0-E2 — COMPLETE (code)
+
+Segmented JSONL journal:
+
+- `gps-<ts>-<id>.jsonl.active` → append → seal → `.jsonl.ready`
+- Seal on docs **or** bytes **or** `GPSPOINT_SEGMENT_SEAL_MS`
+- ACK = local durability only (no fsync; process-crash safe, not power-loss strong)
+- Legacy `hot-`/`pending-` still drained until extinct
+- Focused tests: `test/gpspointsSegmentJournal.test.js` (12)
+
+---
+
+## P0-E3 — COMPLETE (code)
+
+- Entrypoint: `workers/gpspoints-writer.js`
+- PM2: `alfursan-gpspoints-writer` in `ecosystem.config.cjs` (instances=1, fork, autorestart)
+- Persistence: `GPSPOINT_EXTERNAL_WRITER=1` → mode `producer` (journal/ACK only)
+- Dual-drain forbidden via `gpspoints-drain.lock`
+- Own Mongo pool: `GPSPOINT_WRITER_MONGO_MAX_POOL` default **8** (`MONGO_MAX_POOL_SIZE`)
+- Heartbeat file + `/health` fields
+- Focused tests: `test/gpspointsWriterProcess.test.js` (failure domain, dual-lock, reclaim)
+
+### Deploy / rollback (manual — agent does not deploy)
+
+1. Deploy code  
+2. Set `GPSPOINT_EXTERNAL_WRITER=1`  
+3. `pm2 start ecosystem.config.cjs` or `pm2 restart alfursan-bridge alfursan-gpspoints-writer`  
+4. Rollback: stop writer → `GPSPOINT_EXTERNAL_WRITER=0` → restart persistence/bridge  
 
 ---
 
@@ -96,76 +119,35 @@ Raw enqueue reject → HTTP 503 **before** normalize/forward/WS.
 
 ### Fix
 
-1. Initiate raw archival without gating realtime
-2. Dispatch forward queue on first fingerprint
-3. Await **local journal durable** only (not Mongo) for HTTP 202
-4. On raw durable failure → 503 (Traccar retries raw) after realtime already ran
-5. Exact retry fingerprint suppresses live+persistence; raw may retry
+1. Initiate raw archival without gating realtime  
+2. Dispatch forward queue on first fingerprint  
+3. Await **local journal durable** only (not Mongo) for HTTP 202  
+4. On raw durable failure → 503 after realtime already ran  
+5. Exact retry fingerprint suppresses live+persistence; raw may retry  
 
-### Defaults
-
-- `FORWARD_RETRY_DEDUPE_TTL_MS=120000`
-- `FORWARD_RETRY_DEDUPE_MAX=100000` (~50 MB @ ~500 B/entry)
-- Future 1–2k pkt/s: raise MAX to **250000** (~125 MB) **or** shorten TTL to 60s — watch `forward_retry_cache_evicted_capacity_total`
-- Do not remove `serverTime` from fingerprint without evidence (Traccar retries reuse same Position object)
-
-### Expected post-deploy
-
-- Raw queue full / durable fail does **not** freeze listeners on first packet
-- `raw_failure_realtime_continued_total` may increment under raw pressure
-- `forward_exact_retry_total` rises when Traccar retries after 503
-- Watch `raw_durable_accept_latency_p99_ms` and retry-cache eviction counters
-- Live eligibility may improve further vs post-P0-A (still do **not** loosen freshness in P0-B)
+Defaults: `FORWARD_RETRY_DEDUPE_TTL_MS=120000`, `FORWARD_RETRY_DEDUPE_MAX=100000`.
 
 ---
 
 ## P0-C notes (do not implement yet)
 
-Post-P0-A live eligibility ≈0.51, OOO still high. After P0-B exact-retry metrics, re-measure before changing freshness/order/tenant throttle.
-
----
-
-## P0-E1 — COMPLETE (code)
-
-Implemented in `lib/gpsPointWriter.js` + `workers/persistence-worker.js` env wiring:
-
-- Open many legacy `.jsonl` files per cycle; **combine** docs into `insertMany` up to `batchSize`
-- Doc-budget fairness between oldest and newest spool files
-- Metrics: `gpspoints_mongo_docs_per_flush_*`, `gpspoints_spool_docs`
-
-**Do not start E2** until authorized. After E1 deploy, watch: spool file count ↓, `docs_per_flush_avg` → ~batch size, oldest age ↓, journaled≈received, ACK still journal-only.
+Post-P0-A live eligibility ≈0.51, OOO still high. Re-measure after P0-B/E3 deploy before changing freshness.
 
 ---
 
 ## FUNCTIONAL — power / model sync
 
-`traccar_power_seen_total` observed (e.g. 6). Full SEEWORLD E2E later — do not calculate voltage in Node.
-
-**Model sync (2026-09-06):** lifecycle-based, not packet-based. Negative cache default **10 min**. No per-packet `skipped: no tr_model` flood. Traccar restart (`model=null`) still forces one re-sync. See ARCHITECTURE.md.
-
----
-
-## Startup reconciliation
-
-Empty Traccar device list → mark Mongo-online devices offline remains intentional. Reporting audit must check duplicate outage records on restart (Phase 5).
+Do not calculate voltage in Node. Model sync is lifecycle-based (ARCHITECTURE.md).
 
 ---
 
 ## Completed (do not regress)
 
-- Traccar gateway; Node owns RT/business/history; gpslogs gone; lean gpspoints; raw forensic
-- Realtime ≠ business; status/trip coalesce; overspeed cache; schedulers not duplicated on worker
-- IPC bound+spool; parent IPC batching; gpspoints journal before ACK (no force Mongo flush)
-- Startup reconciliation; tr_model sync; **P0-A raw drain**; **P0-B raw/RT failure domains**; **P0-E1 multi-file Mongo combine**
-
----
-
-## SLOs (steady-state targets)
-
-Ingress→WS p99 preferably &lt;250ms; event-loop p99 preferably &lt;50ms; queues not growing; transition drops=0 (Phase 3); no claim of 10k-ready early.
+- Traccar gateway; lean gpspoints; raw forensic; IPC journal-before-ACK  
+- **P0-A** raw drain; **P0-B** raw/RT domains; **P0-E1** verified; **P0-E2** segments; **P0-E3** dedicated writer  
 
 ---
 
 ## MUST NOT
 
-Skip phase order; Redis/Kafka now; PM2 cluster whole app; weaken freshness in P0-B; optimize gpsPointWriter in P0-B; disable/sample raw; push/deploy from agent; full suite/load unless asked; combine E1+E2+E3 into one uncontrolled rewrite; create 8 gpspoints-writers without throughput proof.
+Skip phase order; Redis/Kafka now; PM2 cluster whole app; dual gpspoints drain; 8 writers without proof; push/deploy from agent; full suite/load unless asked.

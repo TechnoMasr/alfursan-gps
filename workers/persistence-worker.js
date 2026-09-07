@@ -70,13 +70,25 @@ function isValidGpsCoord(lat, lon) {
   return Number.isFinite(a) && Number.isFinite(b) && !(a === 0 && b === 0);
 }
 
+const gpsPointExternalWriter =
+  String(process.env.GPSPOINT_EXTERNAL_WRITER || "0") === "1" ||
+  String(process.env.GPSPOINT_EXTERNAL_WRITER || "").toLowerCase() === "true";
+
 const gpsPointWriter = createGpsPointWriter({
-  insertMany: (docs) => GpsPoint.insertMany(docs, { ordered: false }),
+  mode: gpsPointExternalWriter ? "producer" : "full",
+  insertMany: gpsPointExternalWriter
+    ? async () => {
+        throw new Error("gpspoints_external_writer_enabled_no_local_mongo_drain");
+      }
+    : (docs) => GpsPoint.insertMany(docs, { ordered: false }),
   spoolDir: process.env.GPSPOINT_SPOOL_DIR || undefined,
   batchSize: Number(process.env.GPSPOINT_BATCH_SIZE || 250) || 250,
   flushMs: Number(process.env.GPSPOINT_FLUSH_MS || 100) || 100,
   memHigh: Number(process.env.GPSPOINT_MEM_HIGH || 10000) || 10000,
   journalCoalesceMs: Number(process.env.GPSPOINT_JOURNAL_COALESCE_MS || 50) || 50,
+  segmentMaxDocs: Number(process.env.GPSPOINT_SEGMENT_MAX_DOCS || 1000) || 1000,
+  segmentMaxBytes: Number(process.env.GPSPOINT_SEGMENT_MAX_BYTES || 2097152) || 2097152,
+  segmentSealMs: Number(process.env.GPSPOINT_SEGMENT_SEAL_MS || 200) || 200,
   maxMongoBatchesPerCycle:
     Number(process.env.GPSPOINT_MAX_MONGO_BATCHES_PER_CYCLE || 16) || 16,
   maxFilesPerCycle: Number(process.env.GPSPOINT_DRAIN_MAX_FILES_PER_CYCLE || 500) || 500,
@@ -86,6 +98,11 @@ const gpsPointWriter = createGpsPointWriter({
   metrics: bridgeMetrics,
   log: console,
 });
+if (gpsPointExternalWriter) {
+  console.log(
+    "[persistence-worker] GPSPOINT_EXTERNAL_WRITER=1 — journal/ACK only; Mongo drain via alfursan-gpspoints-writer"
+  );
+}
 setGpsPointWriter(gpsPointWriter);
 
 const tripState = new Map();

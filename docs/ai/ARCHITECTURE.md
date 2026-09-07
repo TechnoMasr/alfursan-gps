@@ -2,7 +2,7 @@
 
 **Source of truth for AI agents.** Prefer CURRENT HEAD over old Grok/Codex audit reports.
 
-Last updated: 2026-09-07 (P0-E architecture locked; E1 implemented)
+Last updated: 2026-09-07 (P0-E1 verified; E2+E3 implemented)
 
 ---
 
@@ -32,37 +32,70 @@ Exactly these responsibilities — **not** multiple full copies of the app, **no
 |---------|------|----------------|
 | Realtime parent | Auth, WS, live, IPC enqueue, light orchestration | Heavy reports, long gpspoints Mongo drain (final), raw Mongo drain (final) |
 | Raw archive worker | `traccar_ingress_raw` journal→Mongo | WS, business, reports |
-| **gpspoints-writer** | Legacy spool + segmented journal → Mongo batches, retry, quarantine, gpspoints metrics | WS, business, reports, model sync, tenant broadcast |
+| **gpspoints-writer** (`alfursan-gpspoints-writer`) | Legacy spool + segmented journal → Mongo batches, retry, quarantine, gpspoints metrics | WS, business, reports, model sync, tenant broadcast |
 | **alfursan-analytics** | Global scheduled analytics/report generation (**exactly one** PM2 instance) | Packet path, WS |
 | Workers 0..7 | Per-IMEI gpspoint **journal** + business | Global schedulers, owning long Mongo gpspoints drain (final) |
 
-**Batching + isolation are both required.** Process split does not replace useful `insertMany` batches. Do **not** create 8 gpspoints-writers; partition later only if one properly batched writer cannot meet throughput.
+**Batching + isolation are both required.** Process split does not replace useful `insertMany` batches. Do **not** create 8 gpspoints-writers.
 
-### GPSPoints final handoff (filesystem)
+Process isolation removes Node event-loop contention from GPSPoints drain. **Physical disk I/O contention can still exist** at the OS level (observed during E1 catch-up: raw durable p99 temporarily ~5s).
+
+### GPSPoints filesystem handoff
 
 ```text
-persistence / business side:
-  receive GPSPoint → normalize/build → durable append/journal → ACK → continue business
+persistence / business side (producer):
+  receive → build doc → append active segment → ACK (local durability only) → seal → continue business
 
-Must NOT own long-running GPSPoints Mongo drain (final architecture).
-
-gpspoints-writer:
-  active → sealed/ready → draining → Mongo ACK → done/delete
+gpspoints-writer (drain):
+  ready → claim draining.<pid> → Mongo insertMany → delete
+  (+ legacy hot-/pending-*.jsonl combine batches until extinct)
 ```
 
-Atomic renames. Crash at any state recoverable. Prefer filesystem durable handoff. **No Redis.**
+Atomic rename transitions. Crash recoverable. **No Redis.**
 
-### GPSPoints phases (P0-E) — staged, not one rewrite
+### Durability contract (honest)
+
+- ACK after local `appendFile`/`writeFile` + path visibility (rename for seal).
+- **Process-crash durable** while OS page cache survives.
+- **No fsync** — power-loss / kernel crash may lose the last unflushed appends.
+- Mongo is **never** required before IPC ACK.
+- Semantics remain **at-least-once**: Mongo success + crash before delete → segment may replay. Do not silently discard. Idempotency index work stays separate unless required later.
+
+### GPSPoints phases (P0-E)
 
 | Phase | Work | Status |
 |-------|------|--------|
-| **E1** | Combine legacy spool files into useful Mongo batches (250–500); doc-based old/new fairness; raise drain budget; preserve durability + journal-before-ACK; **no** journal format change; **no** PM2 split | **COMPLETE (code)** |
-| **E2** | Segmented durable journal + legacy reader coexistence until backlog zero | Next |
-| **E3** | Move Mongo drain to dedicated PM2 `gpspoints-writer` (architectural isolation — not postponed solely on event-loop measurements) | After E2 |
+| **E1** | Combine legacy files into useful Mongo batches; doc fairness | **COMPLETE + PRODUCTION VERIFIED** |
+| **E2** | Segmented durable journal (`*.jsonl.active` → `*.jsonl.ready`) + legacy dual-read | **COMPLETE (code + focused tests)** |
+| **E3** | Dedicated PM2 `alfursan-gpspoints-writer`; producer journal-only when `GPSPOINT_EXTERNAL_WRITER=1` | **COMPLETE (code + focused tests)** |
 
-Producer ACK remains: **local durability only** (never wait Mongo).
+### Segment defaults (configurable)
 
-E1 knobs (defaults): `GPSPOINT_BATCH_SIZE=250`, `GPSPOINT_MAX_MONGO_BATCHES_PER_CYCLE=16`, `GPSPOINT_DRAIN_MAX_FILES_PER_CYCLE=500`, `GPSPOINT_DRAIN_OLD_DOC_RATIO=0.5`, `GPSPOINT_JOURNAL_COALESCE_MS=50`.
+- `GPSPOINT_SEGMENT_MAX_DOCS=1000` (500–2000 band)
+- `GPSPOINT_SEGMENT_MAX_BYTES=2097152` (2 MiB)
+- `GPSPOINT_SEGMENT_SEAL_MS=200`
+- Mongo batch: `GPSPOINT_BATCH_SIZE=250` (toward 500 later)
+
+### Dual-drain guard / rollback
+
+- Exclusive `gpspoints-drain.lock` in spool dir — **never** two Mongo drains on the same work.
+- Production E3: set `GPSPOINT_EXTERNAL_WRITER=1` on persistence worker + run `alfursan-gpspoints-writer`.
+- Rollback: stop writer, set `GPSPOINT_EXTERNAL_WRITER=0`, restart persistence (mode `full`).
+
+### PM2 (see `ecosystem.config.cjs`)
+
+```bash
+# Enable external writer in .env first:
+#   GPSPOINT_EXTERNAL_WRITER=1
+pm2 start ecosystem.config.cjs
+pm2 restart alfursan-gpspoints-writer
+pm2 logs alfursan-gpspoints-writer
+```
+
+Apps today: `alfursan-bridge`, `alfursan-gpspoints-writer` (fork, instances=1, autorestart). Later: raw archive, analytics×1, 8 IMEI workers.
+
+Writer heartbeat file: `data/gpspoints-spool/gpspoints-writer.heartbeat.json` — `/health` exposes `gpspoints_writer_alive`, `gpspoints_writer_last_heartbeat`, `gpspoints_writer_last_persisted_at`.
+
 ---
 
 ## High-level flow (current after P0-B)
@@ -173,7 +206,7 @@ Production verification: set `BRIDGE_DEBUG_IMEI=<imei>` to log `forward_retry_fi
 | 100k | ~50 MB (current default) |
 | 250k | ~125 MB (for ~2k pkt/s × 120s) |
 
-Cleanup: expire walk is O(expired prefix), capped at 64 deletes/call — no full-map scan. Capacity eviction prefers non-`processing` entries. Metrics: `forward_retry_cache_size`, `forward_retry_cache_expired_total`, `forward_retry_cache_evicted_capacity_total`.
+Cleanup: expire walk is O(expired prefix), capped at 64 deletes/call — no full-map scan. Capacity eviction prefers non-`processing` entries. Metrics: `forward_retry_cache_size`, `forward_retry_cache_evicted_capacity_total`, `forward_retry_cache_expired_total`.
 
 ### Processing states
 
@@ -225,6 +258,8 @@ HTTP may await **local raw journal** only (for Traccar retry contract).
 | `forward_retry_suppressed_persistence_total` | Persistence path skipped due to exact retry |
 | `forward_retry_cache_size` | Dedupe map size |
 | `raw_ingress_mongo_attempted_total` | Async Mongo (after journal) — not on HTTP critical path |
+| `gpspoints_writer_alive` | Dedicated writer heartbeat fresh |
+| `gpspoints_backlog_*` | Spool backlog docs/files/bytes/age |
 
 ---
 
@@ -241,6 +276,7 @@ Parent batches `PERSISTENCE_IPC_BATCH_MAX_ITEMS=100` / `WAIT_MS=5`. ACK ≠ Mong
 - GT06 parse / voltage in Node; `position.id` identity
 - Sampling / stripping `raw_payload`
 - Global analytics in all future partition workers
+- Dual Mongo drain on the same gpspoints spool
 
 ---
 

@@ -5,8 +5,11 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/admin';
+const mongoMaxPoolSize = Number(process.env.MONGO_MAX_POOL_SIZE || 100) || 100;
 
-mongoose.connect(uri)
+mongoose.connect(uri, {
+  maxPoolSize: mongoMaxPoolSize,
+})
   .then(async () => {
     console.log('✅ Connected to MongoDB');
     await ensureTraccarRawIngressRetentionIndex();

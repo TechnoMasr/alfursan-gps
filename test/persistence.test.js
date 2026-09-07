@@ -225,7 +225,12 @@ describe("gpspoints batch writer + spool", () => {
     assert.equal(metrics.gpspoints_journaled_total, 1);
     assert.equal(mongoStarted, false, "journal must complete before Mongo drain");
     assert.ok(
-      fs.readdirSync(spoolDir).some((n) => n.endsWith(".jsonl")),
+      fs.readdirSync(spoolDir).some(
+        (n) =>
+          n.endsWith(".jsonl") ||
+          n.endsWith(".jsonl.active") ||
+          n.endsWith(".jsonl.ready")
+      ),
       "durable spool present before Mongo"
     );
     const drain = writer.flushCycle();
