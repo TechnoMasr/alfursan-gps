@@ -341,7 +341,9 @@ describe("durability: large spool fairness + realtime independence", () => {
       flushMs: 60_000,
       drainNewFilesPerCycle: 2,
       drainOldFilesPerCycle: 1,
-      maxMongoBatchesPerCycle: 3,
+      drainOldDocRatio: 0.5,
+      maxFilesPerCycle: 6,
+      maxMongoBatchesPerCycle: 1,
       batchSize: 50,
       insertMany: async (docs) => {
         persisted.push(...docs);
@@ -358,7 +360,7 @@ describe("durability: large spool fairness + realtime independence", () => {
     await writer.flushJournal();
     await writer.flushCycle();
     assert.ok(persisted.some((d) => d.tag === "new-1"));
-    assert.ok(persisted.length < 21);
+    assert.ok(persisted.length <= 6, `expected capped fair drain, got ${persisted.length}`);
     assert.ok(jsonlFiles(spoolDir).length > 0);
     writer.simulateCrash();
     fs.rmSync(spoolDir, { recursive: true, force: true });
@@ -455,7 +457,7 @@ describe("durability: idempotency index readiness helpers", () => {
   it("refuses unique index creation when duplicates exist", () => {
     assert.equal(INDEX_OPTIONS.unique, true);
     assert.deepEqual(INDEX_OPTIONS.partialFilterExpression, {
-      traccar_position_id: { $exists: true, $type: "number" },
+      traccar_position_id: { $exists: true, $type: "number", $gt: 0 },
     });
     const dirty = summarizeDiagnostic({
       total: 10,

@@ -76,6 +76,13 @@ const gpsPointWriter = createGpsPointWriter({
   batchSize: Number(process.env.GPSPOINT_BATCH_SIZE || 250) || 250,
   flushMs: Number(process.env.GPSPOINT_FLUSH_MS || 100) || 100,
   memHigh: Number(process.env.GPSPOINT_MEM_HIGH || 10000) || 10000,
+  journalCoalesceMs: Number(process.env.GPSPOINT_JOURNAL_COALESCE_MS || 50) || 50,
+  maxMongoBatchesPerCycle:
+    Number(process.env.GPSPOINT_MAX_MONGO_BATCHES_PER_CYCLE || 16) || 16,
+  maxFilesPerCycle: Number(process.env.GPSPOINT_DRAIN_MAX_FILES_PER_CYCLE || 500) || 500,
+  drainOldDocRatio: Number(process.env.GPSPOINT_DRAIN_OLD_DOC_RATIO || 0.5) || 0.5,
+  drainNewFilesPerCycle: Number(process.env.GPSPOINT_DRAIN_NEW_FILES_PER_CYCLE || 2) || 2,
+  drainOldFilesPerCycle: Number(process.env.GPSPOINT_DRAIN_OLD_FILES_PER_CYCLE || 1) || 1,
   metrics: bridgeMetrics,
   log: console,
 });

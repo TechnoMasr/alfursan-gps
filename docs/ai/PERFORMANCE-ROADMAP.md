@@ -2,7 +2,7 @@
 
 **Source of truth for AI agents.** Update after every completed phase. CURRENT HEAD > old audit reports.
 
-Last updated: 2026-09-06 — **Model-sync lifecycle fix** (in addition to P0-B hardened)
+Last updated: 2026-09-07 — **P0-E1 complete; E2 next; E3 dedicated writer committed**
 
 ---
 
@@ -26,26 +26,56 @@ Server: 12 vCPU, 31 GB RAM. Node v20, PM2, Mongo localhost, Traccar memory gatew
 
 ---
 
+## Final process map (COMMITTED)
+
+1. realtime / bridge parent  
+2. raw archive worker  
+3. **gpspoints-writer** (dedicated PM2; **one** instance initially — failure-domain / event-loop isolation)  
+4. **alfursan-analytics** (dedicated PM2; EXACTLY ONE; global schedulers/reports only)  
+5. 8 IMEI-partitioned business/persistence workers (journal + business; **must not** start global schedulers)
+
+No Redis. No full-app PM2 cluster. Do not create multiple full copies of the whole application.
+
+**Both required:** correct Mongo batching **and** process isolation (CPU, event loops, crashes, Mongo pools, restarts).
+
+---
+
 ## Execution order (STRICT)
 
 | Phase | Name | Status |
 |-------|------|--------|
-| **P0-A** | Raw writer drain deadlock | **COMPLETE + PRODUCTION VERIFIED** (2026-09-06) |
-| **P0-B** | Separate raw failure domain from realtime + exact retry dedupe | **HARDENED** (pre-deploy); await manual verify |
-| **P0-B2** | Dedicated Raw Archive Worker (process isolation) | Documented next isolation step |
-| **P0-C** | Analyze remaining live OOO/stale after exact-retry suppression; RT latency metrics | After P0-B prod verify |
-| **P0-D** | Degradation survival (listeners alive when raw/Mongo sick) | After P0-C |
-| **P0-E** | Gpspoints async Mongo drain / batch efficiency investigation | After fresh prod sample (spool depth/age trend) |
-| **FUNCTIONAL** | SEEWORLD / `tr_model` / `attributes.power` live E2E | Note: `traccar_power_seen_total` observed >0 |
-| **Phase 2** | Geofence transition-only Mongo writes | Later |
+| **P0-A** | Raw writer drain deadlock | **COMPLETE + PRODUCTION VERIFIED** |
+| **P0-B** | Raw vs realtime failure domains + retry dedupe | **HARDENED** |
+| **P0-B2** | Dedicated raw archive worker | Documented |
+| **P0-C** | Live OOO/stale after retry suppression | After P0-B verify |
+| **P0-D** | Degradation survival | After P0-C |
+| **P0-E1** | Gpspoints: combine legacy files → useful Mongo batches + doc fairness | **COMPLETE (code + focused tests)** |
+| **P0-E2** | Segmented durable journal + legacy reader | **NEXT** |
+| **P0-E3** | Dedicated PM2 `gpspoints-writer` (Mongo drain only) | After E2 — **architectural; not optional long-term** |
+| **FUNCTIONAL** | SEEWORLD / tr_model / power E2E | Later |
+| **Phase 2** | Geofence transition-only writes | Later |
 | **Phase 3** | Business queue transition correctness | Later |
-| **Phase 4** | Exactly 8 IMEI-partition workers | Later |
-| **Phase 5-A** | Full reporting/scheduler audit | Later |
-| **Phase 5-B** | ONE analytics worker; partition workers must not start global schedulers | Later |
-| **Phase 5-C** | Report locks/batching/idempotency + `REPORTING-DATA-CONTRACT.md` | Later |
-| **Phase 6** | Mileage N+1 / query amplification | Later |
-| **Phase 7** | Mongo/index + Mongo/Traccar/Node/Linux tuning | Later |
-| **Phase 8** | Controlled load/soak — **only when explicitly authorized** | Later |
+| **Phase 4** | 8 IMEI workers | Later |
+| **Phase 5-A/B/C** | Reporting audit → migrate to `alfursan-analytics` | Later |
+| **Phase 6–8** | Query/index/OS tuning; authorized soak | Later |
+
+---
+
+## P0-E — GPSPoints (committed staged plan)
+
+**Root cause (agreed):** tiny per-IPC-batch spool files (~1 doc/file) + **one `insertMany` per file** → ~115k file backlog, `docs_per_flush_avg≈1.19`. Journal/ACK OK; Mongo drain under-batched.
+
+| Phase | Scope | Status |
+|-------|--------|--------|
+| **E1** | Multi-file combine → one `insertMany` (250–500); **doc**-based old/new fairness (not 2-new/1-old file slots); raise drain budget; preserve durability + ACK=journal only; **no** format change; **no** PM2 split | **DONE** |
+| **E2** | Segmented journal (`active`→`sealed/ready`→`draining`→done); dual-read legacy until zero | Next |
+| **E3** | Move drain to `gpspoints-writer`; producer journals+ACKs only; own Mongo pool; no WS/business/reports/model-sync/tenant broadcast | After E2 |
+
+Batching targets (configurable, validate in prod): batch 250–500; flush size OR short deadline. At ~22 docs/s today; at 1k docs/s → ~2–4 Mongo batches/s @ 500/250; at 2k → ~4–8/s.
+
+E1 defaults: `GPSPOINT_BATCH_SIZE=250`, `GPSPOINT_MAX_MONGO_BATCHES_PER_CYCLE=16`, `GPSPOINT_DRAIN_MAX_FILES_PER_CYCLE=500`, `GPSPOINT_DRAIN_OLD_DOC_RATIO=0.5`, `GPSPOINT_JOURNAL_COALESCE_MS=50`.
+
+**STOP after E1** until E2 is explicitly started. Do not combine E1/E2/E3 into one rewrite.
 
 ---
 
@@ -95,10 +125,15 @@ Post-P0-A live eligibility ≈0.51, OOO still high. After P0-B exact-retry metri
 
 ---
 
-## P0-E notes (do not implement yet)
+## P0-E1 — COMPLETE (code)
 
-Observed: gpspoints journaled 8508 / persisted 6380; spool files 1327; oldest age ~100s; docs/flush avg ~1.71; IPC healthy.  
-Next: another production sample to see if spool age/depth fall or grow, then investigate drain/batching.
+Implemented in `lib/gpsPointWriter.js` + `workers/persistence-worker.js` env wiring:
+
+- Open many legacy `.jsonl` files per cycle; **combine** docs into `insertMany` up to `batchSize`
+- Doc-budget fairness between oldest and newest spool files
+- Metrics: `gpspoints_mongo_docs_per_flush_*`, `gpspoints_spool_docs`
+
+**Do not start E2** until authorized. After E1 deploy, watch: spool file count ↓, `docs_per_flush_avg` → ~batch size, oldest age ↓, journaled≈received, ACK still journal-only.
 
 ---
 
@@ -121,7 +156,7 @@ Empty Traccar device list → mark Mongo-online devices offline remains intentio
 - Traccar gateway; Node owns RT/business/history; gpslogs gone; lean gpspoints; raw forensic
 - Realtime ≠ business; status/trip coalesce; overspeed cache; schedulers not duplicated on worker
 - IPC bound+spool; parent IPC batching; gpspoints journal before ACK (no force Mongo flush)
-- Startup reconciliation; tr_model sync; **P0-A raw drain**; **P0-B raw/RT failure domains**
+- Startup reconciliation; tr_model sync; **P0-A raw drain**; **P0-B raw/RT failure domains**; **P0-E1 multi-file Mongo combine**
 
 ---
 
@@ -133,4 +168,4 @@ Ingress→WS p99 preferably &lt;250ms; event-loop p99 preferably &lt;50ms; queue
 
 ## MUST NOT
 
-Skip phase order; Redis/Kafka now; PM2 cluster whole app; weaken freshness in P0-B; optimize gpsPointWriter in P0-B; disable/sample raw; push/deploy from agent; full suite/load unless asked.
+Skip phase order; Redis/Kafka now; PM2 cluster whole app; weaken freshness in P0-B; optimize gpsPointWriter in P0-B; disable/sample raw; push/deploy from agent; full suite/load unless asked; combine E1+E2+E3 into one uncontrolled rewrite; create 8 gpspoints-writers without throughput proof.

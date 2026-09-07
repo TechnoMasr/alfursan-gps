@@ -2,7 +2,7 @@
 
 **Source of truth for AI agents.** Prefer CURRENT HEAD over old Grok/Codex audit reports.
 
-Last updated: 2026-09-06 (P0-B)
+Last updated: 2026-09-07 (P0-E architecture locked; E1 implemented)
 
 ---
 
@@ -14,6 +14,55 @@ Last updated: 2026-09-06 (P0-B)
 4. Raw forensic archive (`traccar_ingress_raw`)
 5. Analytics / reports
 
+---
+
+## Final process map (COMMITTED)
+
+Exactly these responsibilities — **not** multiple full copies of the app, **not** PM2 cluster of the WS server, **no Redis**:
+
+```text
+1. realtime / bridge parent     (WS, forward, live, IPC dispatch)
+2. raw archive worker           (P0-B2 — dedicated; forensic traccar_ingress_raw)
+3. gpspoints-writer             (P0-E3 — dedicated PM2; Mongo drain only)
+4. alfursan-analytics           (Phase 5 — EXACTLY ONE; global schedulers/reports)
+5. 8 IMEI-partition workers     (Phase 4 — business/persistence; NO global schedulers)
+```
+
+| Process | Owns | Must NOT own |
+|---------|------|----------------|
+| Realtime parent | Auth, WS, live, IPC enqueue, light orchestration | Heavy reports, long gpspoints Mongo drain (final), raw Mongo drain (final) |
+| Raw archive worker | `traccar_ingress_raw` journal→Mongo | WS, business, reports |
+| **gpspoints-writer** | Legacy spool + segmented journal → Mongo batches, retry, quarantine, gpspoints metrics | WS, business, reports, model sync, tenant broadcast |
+| **alfursan-analytics** | Global scheduled analytics/report generation (**exactly one** PM2 instance) | Packet path, WS |
+| Workers 0..7 | Per-IMEI gpspoint **journal** + business | Global schedulers, owning long Mongo gpspoints drain (final) |
+
+**Batching + isolation are both required.** Process split does not replace useful `insertMany` batches. Do **not** create 8 gpspoints-writers; partition later only if one properly batched writer cannot meet throughput.
+
+### GPSPoints final handoff (filesystem)
+
+```text
+persistence / business side:
+  receive GPSPoint → normalize/build → durable append/journal → ACK → continue business
+
+Must NOT own long-running GPSPoints Mongo drain (final architecture).
+
+gpspoints-writer:
+  active → sealed/ready → draining → Mongo ACK → done/delete
+```
+
+Atomic renames. Crash at any state recoverable. Prefer filesystem durable handoff. **No Redis.**
+
+### GPSPoints phases (P0-E) — staged, not one rewrite
+
+| Phase | Work | Status |
+|-------|------|--------|
+| **E1** | Combine legacy spool files into useful Mongo batches (250–500); doc-based old/new fairness; raise drain budget; preserve durability + journal-before-ACK; **no** journal format change; **no** PM2 split | **COMPLETE (code)** |
+| **E2** | Segmented durable journal + legacy reader coexistence until backlog zero | Next |
+| **E3** | Move Mongo drain to dedicated PM2 `gpspoints-writer` (architectural isolation — not postponed solely on event-loop measurements) | After E2 |
+
+Producer ACK remains: **local durability only** (never wait Mongo).
+
+E1 knobs (defaults): `GPSPOINT_BATCH_SIZE=250`, `GPSPOINT_MAX_MONGO_BATCHES_PER_CYCLE=16`, `GPSPOINT_DRAIN_MAX_FILES_PER_CYCLE=500`, `GPSPOINT_DRAIN_OLD_DOC_RATIO=0.5`, `GPSPOINT_JOURNAL_COALESCE_MS=50`.
 ---
 
 ## High-level flow (current after P0-B)
@@ -35,19 +84,22 @@ Frontend / Laravel consume Node realtime and Mongo-backed data.
 
 ---
 
-## Target architecture (not fully built)
+## Target architecture (aligned with final process map)
 
 ```text
 NODE REALTIME PARENT
-  ├─ RAW ARCHIVE WORKER (isolated process)   ← P0-B2 / follow-on; still needed
-  ├─ Worker 0..7  (stableHash(IMEI) % 8) — gpspoints + business
-  └─ ONE analytics / reports worker
+  ├─ RAW ARCHIVE WORKER          (dedicated process)
+  ├─ gpspoints-writer            (dedicated process — Mongo drain)
+  ├─ alfursan-analytics          (EXACTLY ONE — global reports)
+  └─ Worker 0..7                 (stableHash(IMEI)%8 — journal + business only)
 ```
 
-**P0-B** separates **semantic** failure domains (realtime continues if raw queue/Mongo unhealthy).  
-**Raw process isolation** (dedicated worker so disk/Mongo raw work cannot stall the parent event loop) remains **P0-B2** — not implemented in P0-B.
+**P0-B** separates semantic failure domains (realtime vs raw).  
+**P0-B2 / E3 / Phase 5** separate process failure domains.
 
 Do **not** PM2-cluster the entire WebSocket application. Do **not** introduce Redis/Kafka/RabbitMQ/MQTT unless later evidence requires it.
+
+**Invariant:** Global reports/schedulers run only in `alfursan-analytics` (one instance). Partition workers and gpspoints-writer must not start them. Realtime parent must not run heavy report generation.
 
 ---
 

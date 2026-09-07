@@ -138,6 +138,103 @@ describe("gpspoints batch writer + spool", () => {
     assert.equal(writer.getMemoryDepth(), 0);
     await writer.flushAndStop(200);
   });
+
+  it("E1: combines many 1-doc legacy files into one insertMany batch", async () => {
+    const batches = [];
+    for (let i = 1; i <= 40; i++) {
+      fs.writeFileSync(
+        path.join(spoolDir, `pending-${String(i).padStart(13, "0")}-leg.jsonl`),
+        JSON.stringify({ imei: "leg", traccar_position_id: i, n: i }) + "\n"
+      );
+    }
+    const writer = createGpsPointWriter({
+      spoolDir,
+      batchSize: 250,
+      flushMs: 60_000,
+      maxMongoBatchesPerCycle: 2,
+      maxFilesPerCycle: 500,
+      drainOldDocRatio: 0.5,
+      insertMany: async (docs) => {
+        batches.push(docs.slice());
+      },
+      metrics: {},
+    });
+    await writer.flushCycle();
+    assert.equal(batches.length, 1, "one Mongo batch for 40 one-doc files");
+    assert.equal(batches[0].length, 40);
+    assert.equal(fs.readdirSync(spoolDir).filter((n) => n.endsWith(".jsonl")).length, 0);
+    await writer.flushAndStop(200);
+  });
+
+  it("E1: doc-based fairness drains old and new without emptying whole backlog", async () => {
+    const persisted = [];
+    for (let i = 1; i <= 30; i++) {
+      fs.writeFileSync(
+        path.join(spoolDir, `pending-${String(i).padStart(13, "0")}-old.jsonl`),
+        JSON.stringify({ imei: "old", traccar_position_id: i, side: "old" }) + "\n"
+      );
+    }
+    const writer = createGpsPointWriter({
+      spoolDir,
+      batchSize: 100,
+      flushMs: 60_000,
+      maxMongoBatchesPerCycle: 1,
+      maxFilesPerCycle: 8,
+      drainOldDocRatio: 0.5,
+      drainNewFilesPerCycle: 2,
+      drainOldFilesPerCycle: 1,
+      insertMany: async (docs) => {
+        persisted.push(...docs);
+      },
+      metrics: {},
+    });
+    writer.enqueue({ imei: "new", traccar_position_id: 9999, side: "new" });
+    await writer.flushJournal();
+    await writer.flushCycle();
+    assert.ok(persisted.some((d) => d.side === "new"));
+    assert.ok(persisted.some((d) => d.side === "old"));
+    assert.ok(persisted.length <= 8);
+    assert.ok(
+      fs.readdirSync(spoolDir).filter((n) => n.endsWith(".jsonl")).length > 0,
+      "backlog must remain"
+    );
+    await writer.flushAndStop(200);
+  });
+
+  it("E1: enqueue journals without waiting for Mongo ACK", async () => {
+    let mongoStarted = false;
+    let resolveMongo;
+    const mongoGate = new Promise((r) => {
+      resolveMongo = r;
+    });
+    const metrics = {};
+    const writer = createGpsPointWriter({
+      spoolDir,
+      batchSize: 250,
+      flushMs: 60_000,
+      journalCoalesceMs: 0,
+      insertMany: async (docs) => {
+        mongoStarted = true;
+        await mongoGate;
+        return docs;
+      },
+      metrics,
+    });
+    writer.enqueue({ imei: "ack", traccar_position_id: 1 });
+    await writer.flushJournal();
+    assert.equal(metrics.gpspoints_journaled_total, 1);
+    assert.equal(mongoStarted, false, "journal must complete before Mongo drain");
+    assert.ok(
+      fs.readdirSync(spoolDir).some((n) => n.endsWith(".jsonl")),
+      "durable spool present before Mongo"
+    );
+    const drain = writer.flushCycle();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(mongoStarted, true);
+    resolveMongo();
+    await drain;
+    await writer.flushAndStop(200);
+  });
 });
 describe("analytics FIFO never coalesces or hangs", () => {
   it("processes every item in per-IMEI order", async () => {
