@@ -42,7 +42,7 @@ const writer = createGpsPointWriter({
   drainOldDocRatio: Number(process.env.GPSPOINT_DRAIN_OLD_DOC_RATIO || 0.5) || 0.5,
   drainNewFilesPerCycle: Number(process.env.GPSPOINT_DRAIN_NEW_FILES_PER_CYCLE || 2) || 2,
   drainOldFilesPerCycle: Number(process.env.GPSPOINT_DRAIN_OLD_FILES_PER_CYCLE || 1) || 1,
-  heartbeatMs: Number(process.env.GPSPOINT_WRITER_HEARTBEAT_MS || 2000) || 2000,
+  heartbeatMs: Number(process.env.GPSPOINT_WRITER_HEARTBEAT_MS || 1000) || 1000,
   metrics,
   log: console,
 });

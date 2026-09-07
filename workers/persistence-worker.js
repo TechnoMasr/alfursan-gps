@@ -88,7 +88,12 @@ const gpsPointWriter = createGpsPointWriter({
   journalCoalesceMs: Number(process.env.GPSPOINT_JOURNAL_COALESCE_MS || 50) || 50,
   segmentMaxDocs: Number(process.env.GPSPOINT_SEGMENT_MAX_DOCS || 1000) || 1000,
   segmentMaxBytes: Number(process.env.GPSPOINT_SEGMENT_MAX_BYTES || 2097152) || 2097152,
-  segmentSealMs: Number(process.env.GPSPOINT_SEGMENT_SEAL_MS || 200) || 200,
+  segmentMaxAgeMs:
+    Number(
+      process.env.GPSPOINT_SEGMENT_MAX_AGE_MS ||
+        process.env.GPSPOINT_SEGMENT_SEAL_MS ||
+        5000
+    ) || 5000,
   maxMongoBatchesPerCycle:
     Number(process.env.GPSPOINT_MAX_MONGO_BATCHES_PER_CYCLE || 16) || 16,
   maxFilesPerCycle: Number(process.env.GPSPOINT_DRAIN_MAX_FILES_PER_CYCLE || 500) || 500,

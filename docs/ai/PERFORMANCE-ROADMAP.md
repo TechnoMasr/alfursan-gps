@@ -2,7 +2,7 @@
 
 **Source of truth for AI agents.** Update after every completed phase. CURRENT HEAD > old audit reports.
 
-Last updated: 2026-09-07 — **E1 PRODUCTION VERIFIED; E2+E3 code complete**
+Last updated: 2026-09-07 — **E2/E3 production hardening (writer metrics + 5s seal age)**
 
 ---
 
@@ -76,22 +76,22 @@ Proved: E1 batching works; legacy backlog drains faster than ingest; ~1.19 docs/
 Segmented JSONL journal:
 
 - `gps-<ts>-<id>.jsonl.active` → append → seal → `.jsonl.ready`
-- Seal on docs **or** bytes **or** `GPSPOINT_SEGMENT_SEAL_MS`
-- ACK = local durability only (no fsync; process-crash safe, not power-loss strong)
+- Seal on docs **or** bytes **or** `GPSPOINT_SEGMENT_MAX_AGE_MS` (default **5000**; was 200 — too aggressive at ~20–30 docs/s)
+- ACK = local append only (seal not required for durability)
 - Legacy `hot-`/`pending-` still drained until extinct
-- Focused tests: `test/gpspointsSegmentJournal.test.js` (12)
+- Focused tests: `test/gpspointsSegmentJournal.test.js` + `test/gpspointsProdHardening.test.js`
 
 ---
 
-## P0-E3 — COMPLETE (code)
+## P0-E3 — COMPLETE (code) + hardening
 
 - Entrypoint: `workers/gpspoints-writer.js`
 - PM2: `alfursan-gpspoints-writer` in `ecosystem.config.cjs` (instances=1, fork, autorestart)
 - Persistence: `GPSPOINT_EXTERNAL_WRITER=1` → mode `producer` (journal/ACK only)
 - Dual-drain forbidden via `gpspoints-drain.lock`
-- Own Mongo pool: `GPSPOINT_WRITER_MONGO_MAX_POOL` default **8** (`MONGO_MAX_POOL_SIZE`)
-- Heartbeat file + `/health` fields
-- Focused tests: `test/gpspointsWriterProcess.test.js` (failure domain, dual-lock, reclaim)
+- Own Mongo pool: `GPSPOINT_WRITER_MONGO_MAX_POOL` default **8**
+- Rich status heartbeat (~1s): `/health` exposes `gpspoints_writer_persisted_total`, `gpspoints_writer_mongo_*`, batch/latency/backlog — **separate from** producer `gpspoints_*` Mongo counters
+- Focused tests: `test/gpspointsWriterProcess.test.js`, `test/gpspointsProdHardening.test.js`
 
 ### Deploy / rollback (manual — agent does not deploy)
 

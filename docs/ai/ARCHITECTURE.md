@@ -2,7 +2,7 @@
 
 **Source of truth for AI agents.** Prefer CURRENT HEAD over old Grok/Codex audit reports.
 
-Last updated: 2026-09-07 (P0-E1 verified; E2+E3 implemented)
+Last updated: 2026-09-07 (E2/E3 production hardening: writer status + 5s segment age)
 
 ---
 
@@ -73,8 +73,21 @@ Atomic rename transitions. Crash recoverable. **No Redis.**
 
 - `GPSPOINT_SEGMENT_MAX_DOCS=1000` (500–2000 band)
 - `GPSPOINT_SEGMENT_MAX_BYTES=2097152` (2 MiB)
-- `GPSPOINT_SEGMENT_SEAL_MS=200`
+- `GPSPOINT_SEGMENT_MAX_AGE_MS=5000` (legacy alias: `GPSPOINT_SEGMENT_SEAL_MS`)
 - Mongo batch: `GPSPOINT_BATCH_SIZE=250` (toward 500 later)
+
+**Seal is not required for ACK.** A point is durable after append to `.jsonl.active`. Age threshold only bounds unfinished segments for crash recovery / drain visibility.
+
+### Producer metrics vs external writer metrics
+
+| Scope | Examples | Source |
+|-------|----------|--------|
+| **Producer** (persistence worker) | `gpspoints_journaled_total`, `gpspoints_received_total`, local spool depth | IPC / worker metrics |
+| **External writer** (`alfursan-gpspoints-writer`) | `gpspoints_writer_persisted_total`, `gpspoints_writer_mongo_*`, `gpspoints_writer_batch_docs_*`, `gpspoints_writer_backlog_*` | `gpspoints-writer.heartbeat.json` (~1s atomic update) |
+
+Do **not** treat producer `gpspoints_persisted_total=0` under `GPSPOINT_EXTERNAL_WRITER=1` as a drain failure — use `gpspoints_writer_*` fields on `/health`.
+
+Writer heartbeat file: `data/gpspoints-spool/gpspoints-writer.heartbeat.json` — updated periodically (default 1s), never per GPSPoint.
 
 ### Dual-drain guard / rollback
 
@@ -93,8 +106,6 @@ pm2 logs alfursan-gpspoints-writer
 ```
 
 Apps today: `alfursan-bridge`, `alfursan-gpspoints-writer` (fork, instances=1, autorestart). Later: raw archive, analytics×1, 8 IMEI workers.
-
-Writer heartbeat file: `data/gpspoints-spool/gpspoints-writer.heartbeat.json` — `/health` exposes `gpspoints_writer_alive`, `gpspoints_writer_last_heartbeat`, `gpspoints_writer_last_persisted_at`.
 
 ---
 
