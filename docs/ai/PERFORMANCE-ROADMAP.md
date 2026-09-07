@@ -102,6 +102,36 @@ Segmented JSONL journal:
 
 ---
 
+## A0 — Reporting data contract — COMPLETE (docs)
+
+- [`docs/ai/REPORTING-DATA-CONTRACT.md`](./REPORTING-DATA-CONTRACT.md)
+- CURRENT vs TARGET for Mileage / Travel / Idle / Static / Parking / ACC / Overspeed / Connectivity / Trips
+- Documents: Cairo day TARGET, OverspeedAlert vs speed&gt;120, ignition=null idle, gps/alarm duplicate risk
+- **No algorithm redesign** in A0
+
+---
+
+## A1 — Analytics worker + scheduler ownership — COMPLETE (code)
+
+- Entrypoint: `workers/analytics-worker.js`
+- PM2: `alfursan-analytics` (fork, instances=1)
+- Mongo pool: maxPoolSize=8, minPoolSize=1 (`ANALYTICS_MONGO_*` → `MONGO_*` before `mongo.js` load)
+- Ownership: `REPORT_SCHEDULER_OWNER=analytics` (default) | `bridge` (rollback)
+- Dual-run guard: role skip + `data/analytics-spool/report-schedulers.lock`
+- Per-job overlap gates; staggered startup; Static after DailyMileage
+- Heartbeat → bridge `/health` `analytics_*`
+- Focused tests: `test/analyticsOwnership.test.js`
+- **Not in A1:** parking backfill migrate, revive `analyticsQueue.js`, Mileage N+1, Travel×7 redesign
+
+### Deploy / rollback (manual — agent does not deploy)
+
+1. Deploy code  
+2. Ensure `REPORT_SCHEDULER_OWNER=analytics`  
+3. `pm2 start ecosystem.config.cjs` or restart `alfursan-bridge` + `alfursan-analytics`  
+4. Rollback: `pm2 stop alfursan-analytics` → set `REPORT_SCHEDULER_OWNER=bridge` → restart bridge  
+
+---
+
 ## P0-A — VERIFIED
 
 Before: queue=5000, mongo_attempted=0, rejected≈150k.  

@@ -9,6 +9,7 @@ const mongoMaxPoolSize = Number(process.env.MONGO_MAX_POOL_SIZE || 100) || 100;
 
 mongoose.connect(uri, {
   maxPoolSize: mongoMaxPoolSize,
+  minPoolSize: Number(process.env.MONGO_MIN_POOL_SIZE || 0) || 0,
 })
   .then(async () => {
     console.log('✅ Connected to MongoDB');

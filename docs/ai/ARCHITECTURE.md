@@ -105,7 +105,24 @@ pm2 restart alfursan-gpspoints-writer
 pm2 logs alfursan-gpspoints-writer
 ```
 
-Apps today: `alfursan-bridge`, `alfursan-gpspoints-writer` (fork, instances=1, autorestart). Later: raw archive, analytics×1, 8 IMEI workers.
+Apps today: `alfursan-bridge`, `alfursan-gpspoints-writer`, `alfursan-analytics` (fork, instances=1, autorestart). Later: raw archive, 8 IMEI workers.
+
+### A1 — Analytics / global report schedulers
+
+| Topic | Detail |
+|-------|--------|
+| Process | PM2 `alfursan-analytics` → `workers/analytics-worker.js` |
+| Owns | Mileage, Travel, Idle, Static materializers (exactly one owner) |
+| Default | `REPORT_SCHEDULER_OWNER=analytics` — bridge does **not** start them |
+| Rollback | Stop analytics → `REPORT_SCHEDULER_OWNER=bridge` → restart bridge |
+| Dual-run | Forbidden: env role mismatch skips start; `report-schedulers.lock` throws if both try |
+| Overlap | Per-job gates; skipped tick increments `analytics_overlap_prevented_total` |
+| Startup | Stagger mileage → idle → travel; Static chained after mileage (no DailyMileage race) |
+| Mongo pool | `ANALYTICS_MONGO_MAX_POOL=8`, `ANALYTICS_MONGO_MIN_POOL=1` |
+| Heartbeat | `analytics-worker.heartbeat.json` → `/health` `analytics_worker_*` / `analytics_jobs_*` |
+| Contract | [`REPORTING-DATA-CONTRACT.md`](./REPORTING-DATA-CONTRACT.md) |
+
+Does **not** own: parking backfill, live ACC/overspeed/connectivity, trips flush, GPSPoints drain.
 
 ---
 
@@ -271,6 +288,9 @@ HTTP may await **local raw journal** only (for Traccar retry contract).
 | `raw_ingress_mongo_attempted_total` | Async Mongo (after journal) — not on HTTP critical path |
 | `gpspoints_writer_alive` | Dedicated writer heartbeat fresh |
 | `gpspoints_backlog_*` | Spool backlog docs/files/bytes/age |
+| `report_scheduler_owner` | `analytics` (default) or `bridge` (rollback) |
+| `analytics_worker_alive` | Analytics heartbeat age &lt; 15s |
+| `analytics_jobs_*` / `analytics_overlap_prevented_total` | Materializer job counters from heartbeat |
 
 ---
 

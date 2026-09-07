@@ -59,10 +59,16 @@ const { handleAccSample, powerEventToAccOn } = require("./accReportService");
 const { sendPushNotification } = require("./fcm.service");
 const { persistTenantNotification } = require("./notificationStore");
 const { parseCommandResponseLegacyFields } = require("./commandResponseParse");
-const { startIdleStatsScheduler, handleIdleNotifySample } = require("./idleStatsService");
-const { startMileageScheduler } = require("./mileageService");
-const { startTravelStatsScheduler } = require("./travelStatsService");
-const { startStaticStatsScheduler } = require("./staticStatsService");
+const { handleIdleNotifySample } = require("./idleStatsService");
+const {
+  startGlobalReportSchedulers,
+} = require("./lib/globalReportSchedulers");
+const {
+  readAnalyticsWorkerHeartbeat,
+  normalizeOwner,
+  OWNER_BRIDGE,
+  OWNER_ANALYTICS,
+} = require("./lib/reportSchedulerRuntime");
 
 // ====== CONFIG ======
 const BRIDGE_ENV = loadBridgeEnv();
@@ -109,6 +115,7 @@ const imeiToRoomCache = new Map();
 const tenantDbNameToIdCache = new Map();
 const unresolvedTenantRoomImeis = new Set();
 let shuttingDown = false;
+let reportSchedulersController = null;
 let subscribersWss = null;
 const liveFixTracker = createLiveFixTracker();
 const bridgeMetrics = createBridgeMetrics();
@@ -897,6 +904,9 @@ function startSubscribersServer() {
     const externalWriterHb = readGpspointsWriterHeartbeat(
       BRIDGE_ENV.GPSPOINT_SPOOL_DIR || path.join(__dirname, "data", "gpspoints-spool")
     );
+    const analyticsHb = readAnalyticsWorkerHeartbeat(
+      BRIDGE_ENV.ANALYTICS_SPOOL_DIR || path.join(__dirname, "data", "analytics-spool")
+    );
     const writerStats = {
       ...localWriterStats,
       ...externalWriterHb,
@@ -984,6 +994,23 @@ function startSubscribersServer() {
       gpspoints_writer_backlog_files: writerStats.gpspoints_writer_backlog_files || 0,
       gpspoints_writer_backlog_bytes: writerStats.gpspoints_writer_backlog_bytes || 0,
       gpspoints_writer_backlog_oldest_age_ms: writerStats.gpspoints_writer_backlog_oldest_age_ms || 0,
+      report_scheduler_owner: normalizeOwner(
+        process.env.REPORT_SCHEDULER_OWNER || BRIDGE_ENV.REPORT_SCHEDULER_OWNER
+      ),
+      analytics_worker_alive: analyticsHb.analytics_worker_alive || false,
+      analytics_worker_last_heartbeat: analyticsHb.analytics_worker_last_heartbeat || null,
+      analytics_worker_heartbeat_age_ms: analyticsHb.analytics_worker_heartbeat_age_ms ?? null,
+      analytics_worker_pid: analyticsHb.analytics_worker_pid || null,
+      analytics_worker_owner: analyticsHb.analytics_worker_owner || null,
+      analytics_jobs_running: analyticsHb.analytics_jobs_running || 0,
+      analytics_jobs_started_total: analyticsHb.analytics_jobs_started_total || 0,
+      analytics_jobs_completed_total: analyticsHb.analytics_jobs_completed_total || 0,
+      analytics_jobs_failed_total: analyticsHb.analytics_jobs_failed_total || 0,
+      analytics_overlap_prevented_total: analyticsHb.analytics_overlap_prevented_total || 0,
+      analytics_last_success_mileage: analyticsHb.analytics_last_success_mileage || null,
+      analytics_last_success_travel: analyticsHb.analytics_last_success_travel || null,
+      analytics_last_success_idle: analyticsHb.analytics_last_success_idle || null,
+      analytics_last_success_static: analyticsHb.analytics_last_success_static || null,
       startup_reconciliation_last_run_at: bridgeMetrics.startup_reconciliation_last_run_at || null,
       startup_reconciliation_traccar_devices: bridgeMetrics.startup_reconciliation_traccar_devices || 0,
       startup_reconciliation_mongo_online: bridgeMetrics.startup_reconciliation_mongo_online || 0,
@@ -2962,16 +2989,43 @@ async function bootBridge() {
       }
     },
   });
-  startMileageScheduler();
-  startTravelStatsScheduler({ stopThresholdsMinutes: [1, 3, 5, 10, 15, 30, 60] });
-  startIdleStatsScheduler({ idleSpeedKph: 0, idleMinutes: 5, requireAccOn: true, maxGapSeconds: 10 * 60 });
-  startStaticStatsScheduler();
+  // Global report materializers: default owner is alfursan-analytics.
+  // Rollback: REPORT_SCHEDULER_OWNER=bridge + stop alfursan-analytics (never dual-run).
+  const reportOwner = normalizeOwner(
+    process.env.REPORT_SCHEDULER_OWNER || BRIDGE_ENV.REPORT_SCHEDULER_OWNER
+  );
+  if (reportOwner === OWNER_BRIDGE) {
+    try {
+      reportSchedulersController = startGlobalReportSchedulers({
+        processRole: OWNER_BRIDGE,
+        owner: OWNER_BRIDGE,
+        metrics: bridgeMetrics,
+        log: console,
+      });
+      if (reportSchedulersController?.started) {
+        console.warn(
+          "[bridge] REPORT_SCHEDULER_OWNER=bridge — running global report schedulers on realtime (rollback mode)"
+        );
+      }
+    } catch (err) {
+      console.error("[bridge] report scheduler start failed:", err.message);
+    }
+  } else {
+    console.log(
+      `[bridge] report schedulers owned by ${OWNER_ANALYTICS} (REPORT_SCHEDULER_OWNER=${reportOwner}); bridge does not start them`
+    );
+  }
 }
 
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.warn("[bridge] graceful shutdown", { signal });
+  try {
+    reportSchedulersController?.stop?.();
+  } catch (err) {
+    console.warn("[bridge] report scheduler stop error", err.message);
+  }
   try {
     await Promise.race([
       Promise.all([
