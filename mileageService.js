@@ -1,178 +1,419 @@
-const { GpsPoint, DeviceStatus, DailyMileage, AccEvent, OverspeedAlert } = require("./mongo");
-const { calcDistanceDiffSafe } = require("./gpsJumpGuard");
+/**
+ * Mileage materialization — batched Mongo access (chunk-scale, not per-device N+1).
+ *
+ * Semantics preserved from pre-batch HEAD for distance / cursor / jump / speed edge.
+ * Daily overspeed: TARGET = OverspeedAlert only (see REPORTING-DATA-CONTRACT).
+ * Daily day key: Africa/Cairo → UTC range (MILEAGE_BUSINESS_DAY=utc for legacy keys).
+ */
+const { sumMileageKm, computeDailyFromPoints } = require("./lib/mileageCalc");
+const { resolveMileageDay, startOfTodayUTC } = require("./lib/businessDay");
 
 const SCHEDULE_MINUTES = 20;
-const OVERSPEED_LIMIT_KMH = 120;
 const KM_TO_MILES = 0.621371;
-const STOP_COUNT_THRESHOLD_MIN = 3;
+const DEFAULT_CHUNK = 250;
+const EPOCH = new Date(0);
 
-function pointDate(point) {
-  return point?.packet_date || point?.date;
+function mongoModels() {
+  return require("./mongo");
 }
 
-async function updateIncrementalMileage() {
-  const imeisFromStatus = await DeviceStatus.distinct("imei");
-  const imeisFromPoints = await GpsPoint.distinct("imei");
-  const imeis = Array.from(new Set([...imeisFromStatus, ...imeisFromPoints])).filter(Boolean);
+function chunkArray(arr, size) {
+  const out = [];
+  const n = Math.max(1, Number(size) || DEFAULT_CHUNK);
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
 
-  for (const imei of imeis) {
-    const status = await DeviceStatus.findOne({ imei });
-    const lastAt = status?.last_mileage_at || new Date(0);
-    const points = await GpsPoint.find({ imei, packet_date: { $gt: lastAt } })
-      .sort({ packet_date: 1 })
-      .select({ latitude: 1, longitude: 1, speed: 1, packet_date: 1, date: 1 })
-      .lean();
-    if (!points.length) continue;
-    const prevPoint = await GpsPoint.findOne({ imei, packet_date: { $lte: lastAt } })
-      .sort({ packet_date: -1 })
-      .select({ latitude: 1, longitude: 1, speed: 1, packet_date: 1, date: 1 })
-      .lean();
-    const calcPoints = prevPoint ? [prevPoint, ...points] : points;
-    if (calcPoints.length < 2) continue;
+function bump(metrics, key, by = 1) {
+  if (!metrics) return;
+  metrics[key] = (metrics[key] || 0) + by;
+}
 
-    let kmSum = 0;
-    let maxDate = lastAt;
-    for (let i = 1; i < calcPoints.length; i++) {
-      const prev = calcPoints[i - 1];
-      const p = calcPoints[i];
-      const res = calcDistanceDiffSafe(
-        { lat: prev.latitude, lon: prev.longitude, date: pointDate(prev) },
-        { lat: p.latitude, lon: p.longitude, date: pointDate(p) }
-      );
-      const prevSpeed = Number(prev.speed) || 0;
-      const speed = Number(p.speed) || 0;
-      if (!res.isJump && (prevSpeed > 0 || speed > 0)) kmSum += res.distanceKm;
-      maxDate = pointDate(p) || maxDate;
-    }
-    if (kmSum <= 0) continue;
+function resolveOverspeedSource(raw) {
+  const v = String(raw || process.env.MILEAGE_OVERSPEED_SOURCE || "alerts")
+    .trim()
+    .toLowerCase();
+  if (v === "legacy_max" || v === "legacy") return "legacy_max";
+  return "alerts";
+}
 
-    await DeviceStatus.findOneAndUpdate(
-      { imei },
-      {
-        $set: { last_mileage_at: maxDate },
-        $inc: { km_total: kmSum, miles_total: kmSum * KM_TO_MILES },
+async function listMileageImeis(deps) {
+  const { DeviceStatus: DS, GpsPoint: GP } = deps;
+  bump(deps.metrics, "analytics_mileage_mongo_reads", 2);
+  const [fromStatus, fromPoints] = await Promise.all([
+    DS.distinct("imei"),
+    GP.distinct("imei"),
+  ]);
+  return Array.from(new Set([...fromStatus, ...fromPoints])).filter(Boolean);
+}
+
+/**
+ * One prior point per IMEI: latest with packet_date <= lastAt.
+ * Single aggregation per chunk (not per device).
+ */
+async function fetchPriorPointsByImei(imeiLastAtPairs, deps) {
+  const need = imeiLastAtPairs.filter(
+    (x) => x.lastAt && x.lastAt.getTime() > EPOCH.getTime()
+  );
+  if (!need.length) return new Map();
+  const { GpsPoint: GP, metrics } = deps;
+  bump(metrics, "analytics_mileage_mongo_reads", 1);
+  const rows = await GP.aggregate([
+    {
+      $match: {
+        $or: need.map(({ imei, lastAt }) => ({
+          imei,
+          packet_date: { $lte: lastAt },
+        })),
       },
-      { upsert: true }
-    );
-  }
-}
-
-async function buildDailyMileageReport(dayUtc) {
-  const start = dayUtc ? new Date(dayUtc) : startOfTodayUTC();
-  const end = new Date(start);
-  end.setUTCDate(end.getUTCDate() + 1);
-
-  const imeis = await GpsPoint.distinct("imei", {
-    packet_date: { $gte: start, $lt: end },
-  });
-
-  const rows = [];
-  for (const imei of imeis) {
-    const points = await GpsPoint.find({
-      imei,
-      packet_date: { $gte: start, $lt: end },
-    }).sort({ packet_date: 1 }).lean();
-
-    let km = 0;
-    let overspeedCount = 0;
-    let stopMinutes = 0;
-    let stopCount = 0;
-    let zeroStart = null;
-    let zeroCounted = false;
-
-    for (let i = 0; i < points.length; i++) {
-      const p = points[i];
-      const currentAt = new Date(pointDate(p));
-      const speed = Number(p.speed) || 0;
-
-      if (i > 0) {
-        const prev = points[i - 1];
-        const res = calcDistanceDiffSafe(
-          { lat: prev.latitude, lon: prev.longitude, date: pointDate(prev) },
-          { lat: p.latitude, lon: p.longitude, date: pointDate(p) }
-        );
-        const prevSpeed = Number(prev.speed) || 0;
-        if (!res.isJump && (prevSpeed > 0 || speed > 0)) km += res.distanceKm;
-      }
-
-      if (speed > OVERSPEED_LIMIT_KMH) overspeedCount += 1;
-
-      if (speed === 0) {
-        if (!zeroStart) zeroStart = currentAt;
-        const nextTime = i < points.length - 1 ? new Date(pointDate(points[i + 1])) : zeroStart;
-        stopMinutes += Math.max(0, (nextTime - currentAt) / 60000);
-        const stopDur = (currentAt - zeroStart) / 60000;
-        if (!zeroCounted && stopDur >= STOP_COUNT_THRESHOLD_MIN) {
-          stopCount += 1;
-          zeroCounted = true;
-        }
-      } else {
-        if (zeroStart) {
-          const stopDur = (currentAt - zeroStart) / 60000;
-          if (!zeroCounted && stopDur >= STOP_COUNT_THRESHOLD_MIN) stopCount += 1;
-        }
-        zeroStart = null;
-        zeroCounted = false;
-      }
-    }
-
-    if (zeroStart && !zeroCounted) stopCount += 1;
-
-    const [persistedOverspeedCount, accOnCount, accOffCount] = await Promise.all([
-      OverspeedAlert.countDocuments({ imei, start_time: { $gte: start, $lt: end } }),
-      AccEvent.countDocuments({ imei, acc_status: "on", start_time: { $gte: start, $lt: end } }),
-      AccEvent.countDocuments({ imei, acc_status: "off", start_time: { $gte: start, $lt: end } }),
-    ]);
-
-    rows.push({
-      imei,
-      date: start.toISOString().slice(0, 10),
-      miles: km * KM_TO_MILES,
-      overspeed_count: Math.max(overspeedCount, persistedOverspeedCount),
-      total_stop_minutes: stopMinutes,
-      total_stop_count: stopCount,
-      acc_on_count: accOnCount,
-      acc_off_count: accOffCount,
+    },
+    { $sort: { imei: 1, packet_date: -1 } },
+    {
+      $group: {
+        _id: "$imei",
+        latitude: { $first: "$latitude" },
+        longitude: { $first: "$longitude" },
+        speed: { $first: "$speed" },
+        packet_date: { $first: "$packet_date" },
+        date: { $first: "$date" },
+      },
+    },
+  ]);
+  const map = new Map();
+  for (const r of rows) {
+    map.set(r._id, {
+      latitude: r.latitude,
+      longitude: r.longitude,
+      speed: r.speed,
+      packet_date: r.packet_date,
+      date: r.date,
     });
   }
-
-  return rows;
+  return map;
 }
 
-async function buildAndPersistDailyReport(dayUtc) {
-  const rows = await buildDailyMileageReport(dayUtc);
-  const dayStart = dayUtc ? new Date(dayUtc) : startOfTodayUTC();
-  for (const row of rows) {
-    await DailyMileage.findOneAndUpdate(
-      { imei: row.imei, day: dayStart },
-      {
-        $set: {
-          km: row.miles / KM_TO_MILES,
-          miles: row.miles,
-          overspeed_count: row.overspeed_count,
-          total_stop_minutes: row.total_stop_minutes,
-          total_stop_count: row.total_stop_count ?? 0,
-          acc_on_count: row.acc_on_count,
-          acc_off_count: row.acc_off_count,
-        },
-      },
-      { upsert: true }
-    );
+/**
+ * New points since each IMEI cursor — one find with $or, then group in memory.
+ */
+async function fetchNewPointsByImei(imeiLastAtPairs, deps) {
+  if (!imeiLastAtPairs.length) return new Map();
+  const { GpsPoint: GP, metrics } = deps;
+  bump(metrics, "analytics_mileage_mongo_reads", 1);
+  const points = await GP.find({
+    $or: imeiLastAtPairs.map(({ imei, lastAt }) => ({
+      imei,
+      packet_date: { $gt: lastAt },
+    })),
+  })
+    .sort({ imei: 1, packet_date: 1 })
+    .select({ latitude: 1, longitude: 1, speed: 1, packet_date: 1, date: 1, imei: 1 })
+    .lean();
+  const byImei = new Map();
+  for (const p of points) {
+    const list = byImei.get(p.imei) || [];
+    list.push(p);
+    byImei.set(p.imei, list);
   }
-  return rows;
+  bump(metrics, "analytics_mileage_points_processed", points.length);
+  return byImei;
 }
 
-function startOfTodayUTC() {
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+function computeIncrementalUpdates(imeis, statusByImei, pointsByImei, priorByImei) {
+  const { sumMileageKm: sumKm, pointDate: pDate } = require("./lib/mileageCalc");
+  const updates = [];
+  for (const imei of imeis) {
+    try {
+      const status = statusByImei.get(imei);
+      const lastAt = status?.last_mileage_at ? new Date(status.last_mileage_at) : EPOCH;
+      const points = pointsByImei.get(imei) || [];
+      if (!points.length) continue;
+      const prevPoint = priorByImei.get(imei) || null;
+      const { kmSum, maxDate } = sumKm(points, { prevPoint });
+      if (kmSum <= 0) continue;
+      updates.push({
+        imei,
+        kmSum,
+        maxDate: maxDate || pDate(points[points.length - 1]) || lastAt,
+      });
+    } catch (err) {
+      // Isolate per-IMEI failures — do not abort the chunk.
+      updates.push({ imei, error: err });
+    }
+  }
+  return updates;
+}
+
+async function bulkUpdateDeviceMileage(updates, deps) {
+  const ok = updates.filter((u) => u && !u.error && u.kmSum > 0);
+  if (!ok.length) return 0;
+  const { DeviceStatus: DS, metrics } = deps;
+  bump(metrics, "analytics_mileage_mongo_writes", 1);
+  bump(metrics, "analytics_mileage_bulk_writes", 1);
+  const ops = ok.map((u) => ({
+    updateOne: {
+      filter: { imei: u.imei },
+      update: {
+        $set: { last_mileage_at: u.maxDate },
+        $inc: { km_total: u.kmSum, miles_total: u.kmSum * KM_TO_MILES },
+      },
+      upsert: true,
+    },
+  }));
+  await DS.bulkWrite(ops, { ordered: false });
+  return ok.length;
+}
+
+async function processIncrementalChunk(imeis, deps) {
+  const { DeviceStatus: DS, metrics } = deps;
+  bump(metrics, "analytics_mileage_mongo_reads", 1);
+  const statuses = await DS.find({ imei: { $in: imeis } })
+    .select({ imei: 1, last_mileage_at: 1, km_total: 1 })
+    .lean();
+  const statusByImei = new Map(statuses.map((s) => [s.imei, s]));
+  const pairs = imeis.map((imei) => {
+    const lastAt = statusByImei.get(imei)?.last_mileage_at
+      ? new Date(statusByImei.get(imei).last_mileage_at)
+      : EPOCH;
+    return { imei, lastAt };
+  });
+
+  const pointsByImei = await fetchNewPointsByImei(pairs, deps);
+  const activePairs = pairs.filter((p) => (pointsByImei.get(p.imei) || []).length > 0);
+  const priorByImei = await fetchPriorPointsByImei(activePairs, deps);
+  const updates = computeIncrementalUpdates(
+    imeis,
+    statusByImei,
+    pointsByImei,
+    priorByImei
+  );
+  const errors = updates.filter((u) => u.error);
+  for (const e of errors) {
+    deps.log?.warn?.("[mileage] incremental device error", e.imei, e.error?.message);
+  }
+  const written = await bulkUpdateDeviceMileage(updates, deps);
+  bump(metrics, "analytics_mileage_devices_processed", imeis.length);
+  bump(metrics, "analytics_mileage_chunks_processed", 1);
+  return { written, errors: errors.length };
+}
+
+/**
+ * Incremental fleet mileage. Mongo ops scale with chunks, not devices.
+ */
+async function updateIncrementalMileage(options = {}) {
+  const models = options.GpsPoint ? null : mongoModels();
+  const deps = {
+    GpsPoint: options.GpsPoint || models.GpsPoint,
+    DeviceStatus: options.DeviceStatus || models.DeviceStatus,
+    metrics: options.metrics || {},
+    log: options.log || console,
+  };
+  const chunkSize =
+    Number(options.chunkSize || process.env.MILEAGE_CHUNK_SIZE || DEFAULT_CHUNK) ||
+    DEFAULT_CHUNK;
+  const started = Date.now();
+  const imeis = options.imeis || (await listMileageImeis(deps));
+  const chunks = chunkArray(imeis, chunkSize);
+  let written = 0;
+  for (const chunk of chunks) {
+    const r = await processIncrementalChunk(chunk, deps);
+    written += r.written;
+  }
+  deps.metrics.analytics_mileage_duration_ms = Date.now() - started;
+  deps.metrics.analytics_mileage_last_success_at = new Date().toISOString();
+  return { imeis: imeis.length, chunks: chunks.length, written, chunkSize };
+}
+
+async function fetchDayPointsByImei(imeis, dayStart, dayEnd, deps) {
+  if (!imeis.length) return new Map();
+  const { GpsPoint: GP, metrics } = deps;
+  bump(metrics, "analytics_mileage_mongo_reads", 1);
+  const points = await GP.find({
+    imei: { $in: imeis },
+    packet_date: { $gte: dayStart, $lt: dayEnd },
+  })
+    .sort({ imei: 1, packet_date: 1 })
+    .lean();
+  const byImei = new Map();
+  for (const p of points) {
+    const list = byImei.get(p.imei) || [];
+    list.push(p);
+    byImei.set(p.imei, list);
+  }
+  bump(metrics, "analytics_mileage_points_processed", points.length);
+  return byImei;
+}
+
+async function fetchAccCountsByImei(imeis, dayStart, dayEnd, deps) {
+  if (!imeis.length) return new Map();
+  const { AccEvent: AE, metrics } = deps;
+  bump(metrics, "analytics_mileage_mongo_reads", 1);
+  const rows = await AE.aggregate([
+    {
+      $match: {
+        imei: { $in: imeis },
+        start_time: { $gte: dayStart, $lt: dayEnd },
+      },
+    },
+    {
+      $group: {
+        _id: { imei: "$imei", acc_status: "$acc_status" },
+        n: { $sum: 1 },
+      },
+    },
+  ]);
+  const map = new Map();
+  for (const r of rows) {
+    const imei = r._id.imei;
+    const cur = map.get(imei) || { acc_on_count: 0, acc_off_count: 0 };
+    if (r._id.acc_status === "on") cur.acc_on_count = r.n;
+    if (r._id.acc_status === "off") cur.acc_off_count = r.n;
+    map.set(imei, cur);
+  }
+  return map;
+}
+
+async function fetchOverspeedAlertCountsByImei(imeis, dayStart, dayEnd, deps) {
+  if (!imeis.length) return new Map();
+  const { OverspeedAlert: OA, metrics } = deps;
+  bump(metrics, "analytics_mileage_mongo_reads", 1);
+  const rows = await OA.aggregate([
+    {
+      $match: {
+        imei: { $in: imeis },
+        start_time: { $gte: dayStart, $lt: dayEnd },
+      },
+    },
+    { $group: { _id: "$imei", n: { $sum: 1 } } },
+  ]);
+  return new Map(rows.map((r) => [r._id, r.n]));
+}
+
+async function buildDailyMileageReport(dayUtc, options = {}) {
+  const models = options.GpsPoint ? null : mongoModels();
+  const deps = {
+    GpsPoint: options.GpsPoint || models.GpsPoint,
+    AccEvent: options.AccEvent || models.AccEvent,
+    OverspeedAlert: options.OverspeedAlert || models.OverspeedAlert,
+    metrics: options.metrics || {},
+    log: options.log || console,
+  };
+  const { dayStart, dayEnd, ymd } = resolveMileageDay({
+    dayUtc,
+    businessDay: options.businessDay,
+    now: options.now,
+  });
+  const overspeedSource = resolveOverspeedSource(options.overspeedSource);
+  const chunkSize =
+    Number(options.chunkSize || process.env.MILEAGE_CHUNK_SIZE || DEFAULT_CHUNK) ||
+    DEFAULT_CHUNK;
+
+  bump(deps.metrics, "analytics_mileage_mongo_reads", 1);
+  const imeis =
+    options.imeis ||
+    (await deps.GpsPoint.distinct("imei", {
+      packet_date: { $gte: dayStart, $lt: dayEnd },
+    }));
+
+  const rows = [];
+  for (const chunk of chunkArray(imeis, chunkSize)) {
+    const pointsByImei = await fetchDayPointsByImei(chunk, dayStart, dayEnd, deps);
+    const accByImei = await fetchAccCountsByImei(chunk, dayStart, dayEnd, deps);
+    const alertByImei = await fetchOverspeedAlertCountsByImei(
+      chunk,
+      dayStart,
+      dayEnd,
+      deps
+    );
+
+    for (const imei of chunk) {
+      try {
+        const points = pointsByImei.get(imei) || [];
+        const daily = computeDailyFromPoints(points);
+        const alertCount = alertByImei.get(imei) || 0;
+        let overspeed_count = alertCount;
+        if (overspeedSource === "legacy_max") {
+          overspeed_count = Math.max(daily.overspeedCount, alertCount);
+        }
+        const acc = accByImei.get(imei) || { acc_on_count: 0, acc_off_count: 0 };
+        rows.push({
+          imei,
+          date: ymd || dayStart.toISOString().slice(0, 10),
+          miles: daily.km * KM_TO_MILES,
+          overspeed_count,
+          total_stop_minutes: daily.stopMinutes,
+          total_stop_count: daily.stopCount,
+          acc_on_count: acc.acc_on_count,
+          acc_off_count: acc.acc_off_count,
+          _km: daily.km,
+          _legacy_gps_overspeed: daily.overspeedCount,
+        });
+      } catch (err) {
+        deps.log?.warn?.("[mileage] daily device error", imei, err.message);
+      }
+    }
+    bump(deps.metrics, "analytics_mileage_chunks_processed", 1);
+    bump(deps.metrics, "analytics_mileage_devices_processed", chunk.length);
+  }
+
+  return {
+    rows,
+    dayStart,
+    dayEnd,
+    overspeedSource,
+    ymd,
+  };
+}
+
+async function buildAndPersistDailyReport(dayUtc, options = {}) {
+  const models = options.DailyMileage ? null : mongoModels();
+  const deps = {
+    ...options,
+    DailyMileage: options.DailyMileage || models.DailyMileage,
+    metrics: options.metrics || {},
+  };
+  const { rows, dayStart } = await buildDailyMileageReport(dayUtc, options);
+
+  const chunkSize =
+    Number(options.chunkSize || process.env.MILEAGE_CHUNK_SIZE || DEFAULT_CHUNK) ||
+    DEFAULT_CHUNK;
+  for (const chunk of chunkArray(rows, chunkSize)) {
+    if (!chunk.length) continue;
+    bump(deps.metrics, "analytics_mileage_mongo_writes", 1);
+    bump(deps.metrics, "analytics_mileage_bulk_writes", 1);
+    const ops = chunk.map((row) => ({
+      updateOne: {
+        filter: { imei: row.imei, day: dayStart },
+        update: {
+          $set: {
+            km: row._km != null ? row._km : row.miles / KM_TO_MILES,
+            miles: row.miles,
+            overspeed_count: row.overspeed_count,
+            total_stop_minutes: row.total_stop_minutes,
+            total_stop_count: row.total_stop_count ?? 0,
+            acc_on_count: row.acc_on_count,
+            acc_off_count: row.acc_off_count,
+          },
+        },
+        upsert: true,
+      },
+    }));
+    await deps.DailyMileage.bulkWrite(ops, { ordered: false });
+  }
+  deps.metrics.analytics_mileage_last_success_at = new Date().toISOString();
+  // Preserve prior call-site expectation: array of row objects
+  return rows;
 }
 
 function startMileageScheduler() {
   updateIncrementalMileage().catch((err) => console.error("Mileage job error:", err.message));
-  buildAndPersistDailyReport().catch((err) => console.error("Daily mileage report error:", err.message));
+  buildAndPersistDailyReport().catch((err) =>
+    console.error("Daily mileage report error:", err.message)
+  );
   setInterval(() => {
     updateIncrementalMileage().catch((err) => console.error("Mileage job error:", err.message));
-    buildAndPersistDailyReport().catch((err) => console.error("Daily mileage report error:", err.message));
+    buildAndPersistDailyReport().catch((err) =>
+      console.error("Daily mileage report error:", err.message)
+    );
   }, SCHEDULE_MINUTES * 60 * 1000);
 }
 
@@ -181,4 +422,11 @@ module.exports = {
   updateIncrementalMileage,
   buildDailyMileageReport,
   buildAndPersistDailyReport,
+  chunkArray,
+  sumMileageKm,
+  computeDailyFromPoints,
+  resolveOverspeedSource,
+  KM_TO_MILES,
+  DEFAULT_CHUNK,
+  startOfTodayUTC,
 };

@@ -14,7 +14,8 @@ const { handleIdleNotifySample } = require("../idleStatsService");
 const { sendPushNotification } = require("../fcm.service");
 const Trip = require("../trip");
 const mongoose = require("mongoose");
-const { GpsPoint } = require("../mongo");
+const { GpsPoint, DeviceStatus } = require("../mongo");
+const { ensureTripRuntimeState } = require("../lib/tripRuntimeState");
 
 const BRIDGE_LATENCY_DEBUG = String(process.env.BRIDGE_LATENCY_DEBUG ?? "0") === "1";
 const BASE_GAP_MIN = Number(process.env.BASE_GAP_MIN ?? 1) || 1;
@@ -41,6 +42,11 @@ const bridgeMetrics = {
   device_status_skipped_total: 0,
   trip_dirty_count: 0,
   trip_flush_total: 0,
+  trip_recovery_loaded_total: 0,
+  trip_recovery_missing_total: 0,
+  trip_recovery_open_restored_total: 0,
+  trip_recovery_duplicate_prevented_total: 0,
+  trip_recovery_failures_total: 0,
 };
 
 function num(value, fallback = 0) {
@@ -158,6 +164,11 @@ const WORKER_METRIC_KEYS = [
   "device_status_skipped_total",
   "trip_dirty_count",
   "trip_flush_total",
+  "trip_recovery_loaded_total",
+  "trip_recovery_missing_total",
+  "trip_recovery_open_restored_total",
+  "trip_recovery_duplicate_prevented_total",
+  "trip_recovery_failures_total",
 ];
 
 function publishWorkerMetrics() {
@@ -178,18 +189,14 @@ function minutesDiff(a, b) {
 }
 
 async function ensureState(imei) {
-  let st = tripState.get(imei);
-  if (st) return st;
-  const openTrip = await Trip.findOne({ imei, is_open: true }).sort({ start_at: -1 }).lean();
-  st = {
-    currentTripId: openTrip?._id || null,
-    currentDistKm: 0,
-    lastNonZeroAt: openTrip?.end_at || null,
-    prevSpeed: null,
-    prevPacketAt: null,
-  };
-  tripState.set(imei, st);
-  return st;
+  return ensureTripRuntimeState({
+    imei,
+    stateMap: tripState,
+    Trip,
+    DeviceStatus,
+    metrics: bridgeMetrics,
+    log: console,
+  });
 }
 
 async function startTrip(imei, startAt, lat, lon) {

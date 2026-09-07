@@ -197,7 +197,7 @@ const deviceStatusSchema = new mongoose.Schema(
 const dailyMileageSchema = new mongoose.Schema(
   {
     imei: { type: String, index: true },
-    day: { type: Date, index: true }, // بداية اليوم UTC
+    day: { type: Date, index: true }, // Cairo midnight UTC (or UTC midnight if MILEAGE_BUSINESS_DAY=utc)
     km: Number,
     miles: Number,
     overspeed_count: Number,
@@ -213,7 +213,7 @@ dailyMileageSchema.index({ imei: 1, day: 1 }, { unique: true });
 const travelStatSchema = new mongoose.Schema(
   {
     imei: { type: String, index: true },
-    day: { type: Date, index: true }, // بداية اليوم UTC
+    day: { type: Date, index: true }, // Cairo midnight UTC (or UTC midnight if TRAVEL_BUSINESS_DAY=utc)
     stop_threshold_min: { type: Number, default: 1 },
     segments: [
       {
@@ -259,7 +259,7 @@ parkingEventSchema.index({ imei: 1, end_at: -1 });
 const idleStatSchema = new mongoose.Schema(
   {
     imei: { type: String, index: true },
-    day: { type: Date, index: true }, // بداية اليوم UTC
+    day: { type: Date, index: true }, // Cairo midnight UTC (or UTC midnight if IDLE_BUSINESS_DAY=utc)
     idle_duration_seconds: { type: Number, default: 0 },
     idle_count: { type: Number, default: 0 },
     first_idle_start: Date,

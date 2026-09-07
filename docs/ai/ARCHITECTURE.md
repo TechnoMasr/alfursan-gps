@@ -2,7 +2,7 @@
 
 **Source of truth for AI agents.** Prefer CURRENT HEAD over old Grok/Codex audit reports.
 
-Last updated: 2026-09-07 (E2/E3 production hardening: writer status + 5s segment age)
+Last updated: 2026-09-07 — **FINAL REPORTING / ANALYTICS STABILIZATION CLOSED**
 
 ---
 
@@ -107,22 +107,33 @@ pm2 logs alfursan-gpspoints-writer
 
 Apps today: `alfursan-bridge`, `alfursan-gpspoints-writer`, `alfursan-analytics` (fork, instances=1, autorestart). Later: raw archive, 8 IMEI workers.
 
-### A1 — Analytics / global report schedulers
+### A1 — Analytics / global report schedulers (FINAL ownership)
 
 | Topic | Detail |
 |-------|--------|
 | Process | PM2 `alfursan-analytics` → `workers/analytics-worker.js` |
-| Owns | Mileage, Travel, Idle, Static materializers (exactly one owner) |
+| Owns | Mileage, TravelStat, IdleStat, StaticStat materializers (**exactly one** owner) |
 | Default | `REPORT_SCHEDULER_OWNER=analytics` — bridge does **not** start them |
 | Rollback | Stop analytics → `REPORT_SCHEDULER_OWNER=bridge` → restart bridge |
 | Dual-run | Forbidden: env role mismatch skips start; `report-schedulers.lock` throws if both try |
 | Overlap | Per-job gates; skipped tick increments `analytics_overlap_prevented_total` |
 | Startup | Stagger mileage → idle → travel; Static chained after mileage (no DailyMileage race) |
 | Mongo pool | `ANALYTICS_MONGO_MAX_POOL=8`, `ANALYTICS_MONGO_MIN_POOL=1` |
-| Heartbeat | `analytics-worker.heartbeat.json` → `/health` `analytics_worker_*` / `analytics_jobs_*` |
+| Heartbeat | `analytics-worker.heartbeat.json` → `/health` aggregate `analytics_*` only (no per-IMEI) |
 | Contract | [`REPORTING-DATA-CONTRACT.md`](./REPORTING-DATA-CONTRACT.md) |
 
-Does **not** own: parking backfill, live ACC/overspeed/connectivity, trips flush, GPSPoints drain.
+| Process | Reporting / business ownership |
+|---------|--------------------------------|
+| **Realtime Bridge** | Traccar HTTP ingress, WS, orchestration, connectivity/startup lifecycle, model sync |
+| **GPSPoints Writer** | GPSPoints journal → Mongo only |
+| **Analytics** | Mileage, TravelStat, IdleStat, StaticStat (+ future/manual gated analytics ops) |
+| **Business / persistence worker** | Trip, Parking, ACC, Overspeed, live idle notifications, other per-packet transitions |
+
+Does **not** own on analytics: parking backfill auto-run, live ACC/overspeed/connectivity, trips flush, GPSPoints drain.
+
+**Trip restart:** persistence (and bridge path) recover open Trip state once per IMEI via `lib/tripRuntimeState.js` — not analytics.
+
+**Phase status:** Reporting/analytics optimization phase is **CLOSED**. Next scaling track (8 IMEI workers, raw archive isolation, soak) is deferred — do not start without an explicit new phase prompt.
 
 ---
 

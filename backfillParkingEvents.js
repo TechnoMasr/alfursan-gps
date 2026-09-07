@@ -1,44 +1,138 @@
 #!/usr/bin/env node
-
-const mongoose = require("mongoose");
-const { GpsPoint, ParkingEvent } = require("./mongo");
+/**
+ * MANUAL ParkingEvent backfill — ops-triggered only.
+ * Never run from analytics startup or PM2 ecosystem.
+ *
+ * Safety (this phase):
+ * - chunked IMEI processing
+ * - file checkpoint for resume after interrupt
+ * - serial per-IMEI (no Promise.all)
+ * - ParkingEvent open/close semantics UNCHANGED (speed <=1 open, >=5 close)
+ * - document shape UNCHANGED for Laravel
+ */
+const fs = require("fs");
+const path = require("path");
 
 const START_SPEED_KPH = 1;
 const RELEASE_SPEED_KPH = 5;
+const DEFAULT_CHUNK = 25;
+const DEFAULT_CHECKPOINT = path.join(
+  __dirname,
+  "data",
+  "analytics-spool",
+  "parking-backfill.checkpoint.json"
+);
 
 async function main() {
-  const options = parseOptions(process.argv.slice(2));
-  const { start, end } = buildRange(options.days);
-  const imeis = await resolveImeis(options.imeis, start, end);
+  const mongoose = require("mongoose");
+  require("dotenv").config({ path: path.join(__dirname, ".env") });
+  const { GpsPoint, ParkingEvent } = require("./mongo");
 
+  const options = parseOptions(process.argv.slice(2));
+  if (options.help) {
+    printHelp();
+    process.exit(0);
+  }
+
+  const { start, end } = buildRange(options.days);
+  const checkpointPath = options.checkpoint || DEFAULT_CHECKPOINT;
+  const chunkSize = options.chunkSize || DEFAULT_CHUNK;
+
+  let imeis = await resolveImeis(GpsPoint, options.imeis, start, end);
   if (imeis.length === 0) {
     console.log("No IMEIs found for the selected window.");
     await mongoose.disconnect();
     return;
   }
 
-  console.log(`Backfilling parking events for ${imeis.length} IMEI(s) between ${start.toISOString()} and ${end.toISOString()}`);
-  for (const imei of imeis) {
-    try {
-      await rebuildForImei(imei, start, end);
-    } catch (err) {
-      console.error(`IMEI ${imei}: ${err.message}`);
+  const checkpoint = loadCheckpoint(checkpointPath);
+  const done = new Set(checkpoint?.completedImeis || []);
+  if (
+    checkpoint?.start === start.toISOString() &&
+    checkpoint?.end === end.toISOString()
+  ) {
+    imeis = imeis.filter((i) => !done.has(i));
+    console.log(
+      `Resuming parking backfill: ${done.size} done, ${imeis.length} remaining`
+    );
+  } else if (checkpoint?.completedImeis?.length) {
+    console.log("Checkpoint range mismatch — starting fresh progress file.");
+    done.clear();
+  }
+
+  console.log(
+    `Backfilling parking events for ${imeis.length} IMEI(s) between ${start.toISOString()} and ${end.toISOString()} (chunk=${chunkSize})`
+  );
+
+  let processed = 0;
+  for (let i = 0; i < imeis.length; i += chunkSize) {
+    const chunk = imeis.slice(i, i + chunkSize);
+    for (const imei of chunk) {
+      try {
+        await rebuildForImei(GpsPoint, ParkingEvent, imei, start, end);
+        done.add(imei);
+        processed += 1;
+      } catch (err) {
+        console.error(`IMEI ${imei}: ${err.message}`);
+        saveCheckpoint(checkpointPath, {
+          start: start.toISOString(),
+          end: end.toISOString(),
+          completedImeis: [...done],
+          lastError: { imei, message: err.message, at: new Date().toISOString() },
+        });
+        throw err;
+      }
     }
+    saveCheckpoint(checkpointPath, {
+      start: start.toISOString(),
+      end: end.toISOString(),
+      completedImeis: [...done],
+      updatedAt: new Date().toISOString(),
+    });
+    console.log(
+      `Progress: ${done.size} completed (chunk ending ${chunk[chunk.length - 1]})`
+    );
+  }
+
+  try {
+    fs.unlinkSync(checkpointPath);
+  } catch {
+    /* ignore */
   }
 
   await mongoose.disconnect();
-  console.log("Done.");
+  console.log(`Done. Processed ${processed} IMEI(s) this run.`);
+}
+
+function printHelp() {
+  console.log(`Usage: node backfillParkingEvents.js [--days=5] [--imei=a,b] [--chunk-size=25] [--checkpoint=path]
+
+Manual only. Does not start from PM2/analytics.
+Resumable via checkpoint file (default: data/analytics-spool/parking-backfill.checkpoint.json).
+ParkingEvent field shapes are unchanged.`);
 }
 
 function parseOptions(args) {
-  const opts = { days: 5, imeis: null };
+  const opts = {
+    days: 5,
+    imeis: null,
+    chunkSize: DEFAULT_CHUNK,
+    checkpoint: null,
+    help: false,
+  };
   for (const arg of args) {
-    if (arg.startsWith("--days=")) {
+    if (arg === "--help" || arg === "-h") opts.help = true;
+    else if (arg.startsWith("--days=")) {
       const num = parseInt(arg.split("=")[1], 10);
       if (!Number.isNaN(num) && num > 0) opts.days = num;
     } else if (arg.startsWith("--imei=")) {
       const list = arg.split("=")[1];
       if (list) opts.imeis = list.split(",").map((s) => s.trim()).filter(Boolean);
+    } else if (arg.startsWith("--chunk-size=")) {
+      const num = parseInt(arg.split("=")[1], 10);
+      if (!Number.isNaN(num) && num > 0) opts.chunkSize = num;
+    } else if (arg.startsWith("--checkpoint=")) {
+      opts.checkpoint = arg.split("=")[1];
     }
   }
   return opts;
@@ -53,7 +147,7 @@ function buildRange(days) {
   return { start, end };
 }
 
-async function resolveImeis(imeis, start, end) {
+async function resolveImeis(GpsPoint, imeis, start, end) {
   if (Array.isArray(imeis) && imeis.length > 0) return imeis;
   const found = await GpsPoint.distinct("imei", {
     packet_date: { $gte: start, $lte: end },
@@ -61,11 +155,29 @@ async function resolveImeis(imeis, start, end) {
   return found.filter(Boolean);
 }
 
-async function rebuildForImei(imei, start, end) {
+function loadCheckpoint(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function saveCheckpoint(filePath, body) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(body, null, 2), "utf8");
+  fs.renameSync(tmp, filePath);
+}
+
+async function rebuildForImei(GpsPoint, ParkingEvent, imei, start, end) {
   const points = await GpsPoint.find({
     imei,
     packet_date: { $gte: start, $lte: end },
-  }).sort({ packet_date: 1 }).lean().exec();
+  })
+    .sort({ packet_date: 1 })
+    .lean()
+    .exec();
 
   if (points.length === 0) {
     console.log(`IMEI ${imei}: no points in range, skipping.`);
@@ -118,7 +230,9 @@ function buildEventsFromPoints(points) {
     const speed = pickSpeed(point);
 
     if (speed <= START_SPEED_KPH) {
-      current = current ? extendStop(current, ts, lat, lon, speed) : startStop(ts, lat, lon, speed);
+      current = current
+        ? extendStop(current, ts, lat, lon, speed)
+        : startStop(ts, lat, lon, speed);
       continue;
     }
 
@@ -194,7 +308,22 @@ function toDate(value) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-main().catch((err) => {
-  console.error(err);
-  mongoose.disconnect().finally(() => process.exit(1));
-});
+module.exports = {
+  buildEventsFromPoints,
+  parseOptions,
+  loadCheckpoint,
+  saveCheckpoint,
+  START_SPEED_KPH,
+  RELEASE_SPEED_KPH,
+};
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    try {
+      require("mongoose").disconnect().finally(() => process.exit(1));
+    } catch {
+      process.exit(1);
+    }
+  });
+}

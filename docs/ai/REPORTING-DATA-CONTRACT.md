@@ -1,9 +1,11 @@
 # Reporting Data Contract
 
 **Source of truth for AI agents and report migration.**  
-Last updated: 2026-09-07 (A0 contract + A1 ownership; algorithms unchanged)
+Last updated: 2026-09-07 — **FINAL REPORTING / ANALYTICS STABILIZATION CLOSED**
 
 GpsLog is **removed**. Do not reintroduce it.
+
+**Compatibility rule (frozen):** Laravel + frontend consume existing Mongo collections/fields. Do **not** rename collections, models, fields, keys, or report output shapes. Optimization must be transparent. Schema redesign belongs only to the deferred Backend + Frontend reporting phase.
 
 ---
 
@@ -18,143 +20,244 @@ GpsLog is **removed**. Do not reintroduce it.
 | ACC / overspeed event time | `start_time` / `end_time` | Event collections |
 | Connectivity | Transition `at` / `start_at` / `end_at` | Server connection, not vehicle stop |
 
-### Business day (TARGET)
+### Business day (CURRENT)
 
-- Business daily reports use **Africa/Cairo** calendar day.
-- Convert Cairo `[dayStart, dayEnd)` to **UTC** for Mongo range queries.
-- Store materialization keys as UTC instants corresponding to Cairo midnight (document conversion in code when implemented).
+- DailyMileage / Static / Travel / Idle day keys: **Africa/Cairo** midnight as UTC instant (per-report env; default `cairo`).
+- Query window: Cairo `[dayStart, dayEnd)` converted to UTC `packet_date` ranges.
+- Rollback: set corresponding `*_BUSINESS_DAY=utc`.
+- **Migration:** pre-existing UTC-midnight rows are not auto-migrated; new writes use Cairo keys. Static falls back to GpsPoint when DailyMileage row missing for an IMEI.
 
-### Business day (CURRENT HEAD)
+---
 
-- All four global schedulers use `startOfTodayUTC()` — **UTC midnight**, not Cairo.
-- TARGET Cairo conversion is **not implemented yet** (A0 documents intent only).
+## STATE / SEGMENTATION RULES (CURRENT HEAD — do not redefine this phase)
+
+These are **separate product concepts**. Do not unify them in Node without a Backend + Frontend reporting phase.
+
+### Trip (live `Trip` documents)
+
+Used by current reports: daily/monthly trip count, trip history, stop-gap segmentation where supported.
+
+| Rule | CURRENT |
+|------|---------|
+| Moving | `speed > 0` |
+| Ignition | **Not** used for Trip segmentation |
+| `BASE_GAP_MIN` | Default **1** minute (env/config) |
+| Open | First movement when no open trip, **or** movement after stop gap ≥ `BASE_GAP_MIN` |
+| While stopped | Existing open trip **remains open** (does not close immediately on stop) |
+| Resume after gap ≥ BASE_GAP_MIN | Close previous (`end_at = lastNonZeroAt`), then start new Trip |
+| Distance | Existing `distanceDiff` / dirty-flush pipeline |
+| Persistence | Dirty coalesce + `TRIP_FLUSH_INTERVAL_MS`; close flushes before finalize |
+| Restart recovery | Once-per-IMEI from open `Trip` + `DeviceStatus` (`last_speed`, packet times); **no** per-packet Mongo recovery |
+
+**Trip ≠ TravelStat.** Trip is the live/business path collection Laravel already uses.
+
+### TravelStat (historical materialization)
+
+| Rule | CURRENT |
+|------|---------|
+| Source | `gpspoints` only (not live Trip) |
+| Thresholds | `[1,3,5,10,15,30,60]` minutes |
+| Segment | Speed&gt;0 opens; speed==0 + stopDur ≥ threshold closes; open flushed at EOF |
+| `total_stop_count` | Fixed **3** min rule, independent of threshold |
+| Key | `(imei, day, stop_threshold_min)` |
+
+### IdleStat (historical idle totals)
+
+| Rule | CURRENT |
+|------|---------|
+| Source | `gpspoints` |
+| Condition | `isAccOn` (multi-field) when `requireAccOn` **and** `speed <= idleSpeedKph` |
+| Scheduler | `idleSpeedKph=0`, `idleMinutes=5`, `requireAccOn=true`, `maxGapSeconds=600` |
+| ignition=null | → not idle |
+| Output | Daily idle totals on `IdleStat` |
+
+### Live Idle (notifications)
+
+| Rule | CURRENT |
+|------|---------|
+| Path | `handleIdleNotifySample` on bridge/persistence |
+| ACC | `sample.accOn === true` (not the same helper as IdleStat) |
+| maxGapSeconds | **None** (runtime memory only) |
+| Purpose | Notifications — **not** IdleStat materialization |
+
+**IdleStat ≠ live idle notify.** Disagreement is known and deferred.
+
+### StaticStat
+
+| Rule | CURRENT |
+|------|---------|
+| Meaning | Very little movement during the business day |
+| Rule | `daily_mileage_km <= 0.5` → `is_static = true` |
+| Not Static | Ignition off, idle, parking, offline, stale GPS |
+| Source | Prefer `DailyMileage.km`; GpsPoint mileage recalc **only** when DailyMileage missing for that IMEI |
+| Key | `(imei, day)` |
+
+### ParkingEvent
+
+| Rule | CURRENT |
+|------|---------|
+| Open | speed ≤ **1** |
+| Close | speed ≥ **5** |
+| Path | Live business path; manual backfill only for history |
+| Meaning | Separate from Idle / Static / Trip stop-gap |
+
+### Parking / ACC / Overspeed / Connectivity / Mileage
+
+Unchanged business rules in this phase. See sections below. Do not “fix” audit semantic drift without Laravel/frontend redesign.
 
 ---
 
 ## Mileage
 
-| | CURRENT HEAD | TARGET |
-|--|--------------|--------|
-| Source | `gpspoints` | `gpspoints` |
-| Time | `packet_date` (fallback `date`) | Cairo day → UTC range; `packet_date` |
-| Incremental state | `devicestatuses.last_mileage_at`, `$inc km_total/miles_total` | Same collections; safer batching later |
-| Daily materialization | `DailyMileage` unique `(imei, day)` | Same; `day` = Cairo day start as UTC |
-| Jump filter | `calcDistanceDiffSafe` | Keep |
-| Speed edge | Distance counted if prev or current speed &gt; 0 | Keep until redesign |
-| Packet types | GPS + alarm (valid coords) both stored | Same; **do not double-count** same physical fix if both archived — document risk below |
+| | CURRENT (batched) | Notes |
+|--|-------------------|--------|
+| Source | `gpspoints` | Unchanged |
+| Time | `packet_date` (fallback `date`) | Cairo day → UTC range for daily |
+| Incremental | Chunked `$or` finds + prior aggregation + `DeviceStatus.bulkWrite` `$inc/$set` | `MILEAGE_CHUNK_SIZE` default **250** |
+| Daily | Chunked points + AccEvent/OverspeedAlert aggregations + `DailyMileage.bulkWrite` | Not per-IMEI N+1 |
+| Jump filter | `calcDistanceDiffSafe` | Unchanged |
+| Speed edge | Distance if prev or current speed &gt; 0 | Unchanged |
+| Overspeed count | **OverspeedAlert** only (`MILEAGE_OVERSPEED_SOURCE=alerts`) | `legacy_max` restores Math.max(gps&gt;120, alerts) |
+| ACC counts | `AccEvent` aggregation | Unchanged semantics |
 
-**gps/alarm duplicate risk (CURRENT):** `GPSPOINT_TRACK_TYPES = gps|alarm`. If Traccar emits both a GPS position and an alarm-typed position for the same movement sample, both may enter `gpspoints` and inflate distance/stop metrics. No dedupe today.
-
-**Overspeed in daily mileage (CURRENT inconsistency):**
-
-1. Counts points with `speed > 120` (hardcoded `OVERSPEED_LIMIT_KMH`)
-2. Also `OverspeedAlert.countDocuments` for the day
-3. Persists `Math.max(gpsPointCount, alertCount)`
-
-Per-device limit lives in `devicestatuses.alert_speed_limit_value` (used by live overspeed service). Daily report **ignores** that limit for the GpsPoint scan. TARGET: prefer `OverspeedAlert` as authoritative for counts; do not hardcode 120 in daily rebuild (algorithm change later).
-
-**ACC in daily mileage (CURRENT):** `AccEvent` counts for on/off — aligned with TARGET.
+**gps/alarm duplicate risk (still deferred):** `gpspoints` may hold both gps and valid-position alarm samples; no dedupe in this phase.
 
 ---
 
 ## Travel
 
-| | CURRENT | TARGET |
-|--|---------|--------|
-| Source | `gpspoints` | `gpspoints` |
-| Materialization | `TravelStat` unique `(imei, day, stop_threshold_min)` | Same |
-| Thresholds (bridge call) | `[1,3,5,10,15,30,60]` — **7 full rebuilds**/tick | Same semantics; optimize multi-threshold later (not A1) |
-| Segment logic | Speed&gt;0 opens; speed==0 + stop threshold closes | Keep until redesign |
-| Trip collection | **Not used** | Live `Trip` remains business-path; travel report stays GpsPoint-derived |
+| | CURRENT (batched) | Notes |
+|--|-------------------|--------|
+| Source | `gpspoints` only (not live `Trip`) | Unchanged |
+| Day key | Cairo (`TRAVEL_BUSINESS_DAY=cairo`) | `utc` rollback |
+| Thresholds | `[1,3,5,10,15,30,60]` | Same list |
+| Mongo | One IMEI discovery + one GpsPoint read/chunk → CPU × thresholds → `TravelStat.bulkWrite` | Not ×7 Mongo rebuilds |
+| Chunk | `TRAVEL_CHUNK_SIZE` default **150** | Unchanged `computeSegments` |
 
 ---
 
 ## Idle
 
-| | CURRENT | TARGET |
-|--|---------|--------|
-| Source | `gpspoints` | `gpspoints` + ignition semantics |
-| Materialization | `IdleStat` unique `(imei, day)` | Same |
-| Bridge params | `idleSpeedKph=0`, `idleMinutes=5`, `requireAccOn=true`, `maxGapSeconds=600` | Keep params; Cairo day later |
-| Ignition | `isAccOn()`: true/false from `ignition` / `acc_status` / etc. | Explicit |
-
-**ignition=null behavior (CURRENT):** When `requireAccOn=true`, `isAccOn` returns **false** for null/unknown ignition. Those points **never** contribute to idle. TARGET: document this as intentional until product decides otherwise — do **not** infer ignition from speed alone.
-
-Live idle notify (`handleIdleNotifySample`) stays on **business worker** path — not the global IdleStat scheduler.
+| | CURRENT (batched) | Notes |
+|--|-------------------|--------|
+| Source | `gpspoints` only | Unchanged |
+| Day key | Cairo (`IDLE_BUSINESS_DAY=cairo`) | `utc` rollback |
+| Mongo | One GpsPoint read/chunk → `computeIdle` → `IdleStat.bulkWrite` | Not per-IMEI N+1 |
+| Chunk | `IDLE_CHUNK_SIZE` default **150** | Live notify untouched |
 
 ---
 
 ## Static
 
-| | CURRENT | TARGET |
-|--|---------|--------|
-| Source | Prefer `DailyMileage.km`; fallback GpsPoint recalc | Same |
-| Rule | `km <= 0.5` → `is_static` | Same threshold until redesign |
-| Materialization | `StaticStat` `(imei, day)` | Same |
-| Race | Could run before DailyMileage exists for today | A1: Static waits for mileage bundle |
+| | CURRENT (batched) | Notes |
+|--|-------------------|--------|
+| Source | Prefer `DailyMileage.km`; GpsPoint fallback **only** for missing IMEIs | Same rule |
+| Rule | `km <= 0.5` → `is_static` | Unchanged threshold/fields |
+| Day | Aligned with Mileage / Cairo (`STATIC_BUSINESS_DAY` / mileage resolver) | Same key semantics |
+| Mongo | One `DailyMileage.find({ day })` → optional bounded GpsPoint chunks for missing → `StaticStat.bulkWrite` | Not per-IMEI DailyMileage / upsert |
+| Chunk | `STATIC_CHUNK_SIZE` default **500**; `STATIC_FALLBACK_CHUNK_SIZE` default **100** | DailyMileage rows lighter than full-day tracks |
+| Ordering | Startup Static waits for Mileage; recurring still gated by analytics ownership | Preserve dependency |
+| Key / fields | `(imei, day)`, `daily_mileage_km`, `is_static` | Laravel-compatible |
+
+### Static query flow
+
+**Old:** DailyMileage for day (or per-device usage) + per-IMEI StaticStat upsert; GpsPoint recalc could fan out per missing/fallback IMEI.
+
+**New:**
+
+```text
+DailyMileage.find({ day })           // 1 read
+→ identify missing IMEIs only
+→ GpsPoint.find($in chunk)           // only missing; fallback chunk ≤100
+→ sumMileageKm (same helper as mileage)
+→ StaticStat.bulkWrite               // chunks of ≤500
+```
+
+### Amplification (approx, N=10k, DailyMileage complete)
+
+| | Old | New (C=500) |
+|--|-----|-------------|
+| Ops | ~1 + N upserts (+ N GpsPoint if fallback-heavy) ≈ **10k–20k** | ~1 + ⌈N/C⌉ bulkWrites ≈ **~21** (+ rare fallback chunks) |
 
 ---
 
 ## Parking
 
-| | CURRENT | TARGET |
+| | CURRENT | Notes |
 |--|---------|--------|
-| Live | `parkingEventsService` on business path → `ParkingEvent` | Stay on IMEI business workers |
-| Definition | Open speed≤1; close speed≥5 | Keep |
-| Backfill | Manual `backfill:parking` — deleteMany range then insertMany | Ops/analytics-gated later; **not migrated in A1** |
+| Live | `parkingEventsService` → `ParkingEvent` | Business path |
+| Definition | Open speed≤1; close speed≥5 | Unchanged |
+| Backfill | Manual `backfillParkingEvents.js` / npm script | Chunked + file checkpoint; **never** auto at analytics startup |
 
 ---
 
 ## ACC
 
-| | CURRENT | TARGET |
+| | CURRENT | Notes |
 |--|---------|--------|
-| Live | `accReportService` → `AccEvent` (ignition + power events) | Business workers |
-| Daily counts | `AccEvent.countDocuments` in daily mileage | Prefer AccEvent |
-| Null ignition | Ignored on live path (no toggle) | Keep |
+| Live | `accReportService` → `AccEvent` | Business workers |
+| Daily counts | AccEvent in daily mileage | Prefer AccEvent |
+| Null ignition | Ignored on live path | Keep |
 
 ---
 
 ## Overspeed
 
-| | CURRENT | TARGET |
+| | CURRENT | Notes |
 |--|---------|--------|
-| Live | `overspeedService` + per-device limit cache → `OverspeedAlert` | Business workers |
-| Daily count | Hardcoded 120 on GpsPoint **and** OverspeedAlert max | Prefer OverspeedAlert only |
+| Live | `overspeedService` → `OverspeedAlert` | Business workers |
+| Daily count | OverspeedAlert (`alerts` default) | Prefer alerts only |
 
 ---
 
 ## Connectivity
 
-| | CURRENT | TARGET |
+| | CURRENT | Notes |
 |--|---------|--------|
-| Meaning | Tracker **connected to server**, not stopped/idle/ignition | Same |
-| Live | `deviceConnectivityService` + status | Realtime / business |
-| Startup | `runStartupConnectivityReconciliation` on bridge | Stay on bridge (not analytics) |
-| Collection | `DeviceDisconnection` | Same |
+| Meaning | Tracker connected to server | Not stop/idle/ignition |
+| Startup reconciliation | Bridge | Stay on bridge |
 
 ---
 
-## Trips
+## Trips (runtime)
 
-| | CURRENT | TARGET |
+| | CURRENT | Notes |
 |--|---------|--------|
-| Source | `Trip` via persistence-worker dirty flush | IMEI business workers |
-| Schedulers | Do **not** recompute trips | Keep |
+| Collection | `Trip` | Unchanged schema for Laravel |
+| Owner | Persistence / future IMEI workers | Not analytics schedulers |
+| Restart | `lib/tripRuntimeState.js` once-per-IMEI | Metrics `trip_recovery_*` |
 
 ---
 
 ## Global scheduler ownership
 
-| | CURRENT (A1) | TARGET |
-|--|--------------|--------|
-| Owner | Exactly one: `alfursan-analytics` (`REPORT_SCHEDULER_OWNER=analytics`) | Same |
-| Rollback | `REPORT_SCHEDULER_OWNER=bridge` + stop `alfursan-analytics` | Same |
-| Dual run | Forbidden via env role + `report-schedulers.lock` | Same |
-| Overlap | Per-job gates (mileage/travel/idle/static) | Same |
+| | CURRENT | Notes |
+|--|---------|--------|
+| Owner | Exactly one: `alfursan-analytics` | `REPORT_SCHEDULER_OWNER=analytics` |
+| Rollback | `REPORT_SCHEDULER_OWNER=bridge` + stop analytics | Same |
+| Dual run | Forbidden | lock + role |
+| Overlap | Per-job gates | Same |
 | Startup | Staggered; Static after DailyMileage | Same |
 
-Heartbeat: `data/analytics-spool/analytics-worker.heartbeat.json` → bridge `/health` as `analytics_*`.
+Heartbeat: `data/analytics-spool/analytics-worker.heartbeat.json` → bridge `/health` as `analytics_*` (aggregate only).
+
+---
+
+## DEFERRED — BACKEND + FRONTEND REPORTING PHASE
+
+**Do not implement in Node-only analytics work:**
+
+- New reports / dashboard KPIs
+- Laravel or frontend report redesign
+- Collection/field/model renames
+- Trip ↔ TravelStat unification
+- IdleStat ↔ live idle unification
+- User-selectable report semantic changes
+- Historical UTC→Cairo migration UI
+- gps/alarm dedupe redesign
+- Changing Parking/ACC/Overspeed/Travel thresholds “to match audit preference”
+
+Those require joint Backend + Frontend review with Laravel contract changes planned deliberately.
 
 ---
 

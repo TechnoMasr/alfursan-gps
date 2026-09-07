@@ -2,7 +2,7 @@
 
 **Source of truth for AI agents.** Update after every completed phase. CURRENT HEAD > old audit reports.
 
-Last updated: 2026-09-07 — **E2/E3 production hardening (writer metrics + 5s seal age)**
+Last updated: 2026-09-07 — **FINAL REPORTING / ANALYTICS STABILIZATION CLOSED**
 
 ---
 
@@ -53,8 +53,8 @@ No Redis. No full-app PM2 cluster. Batching **and** process isolation both requi
 | **FUNCTIONAL** | SEEWORLD / tr_model / power E2E | Later |
 | **Phase 2** | Geofence transition-only writes | Later |
 | **Phase 3** | Business queue transition correctness | Later |
-| **Phase 4** | 8 IMEI workers | Later |
-| **Phase 5-A/B/C** | Reporting audit → migrate to `alfursan-analytics` | Later |
+| **Phase 4** | 8 IMEI workers | **DEFERRED** (next scaling track) |
+| **Phase 5** | Reporting/analytics stabilization (A0–Static + Trip recovery) | **COMPLETE (code + focused tests) — PHASE CLOSED** |
 | **Phase 6–8** | Query/index/OS tuning; authorized soak | Later |
 
 ---
@@ -121,7 +121,7 @@ Segmented JSONL journal:
 - Per-job overlap gates; staggered startup; Static after DailyMileage
 - Heartbeat → bridge `/health` `analytics_*`
 - Focused tests: `test/analyticsOwnership.test.js`
-- **Not in A1:** parking backfill migrate, revive `analyticsQueue.js`, Mileage N+1, Travel×7 redesign
+- **Not in A1:** parking backfill migrate, revive `analyticsQueue.js` (Mileage + Travel batching done later)
 
 ### Deploy / rollback (manual — agent does not deploy)
 
@@ -129,6 +129,166 @@ Segmented JSONL journal:
 2. Ensure `REPORT_SCHEDULER_OWNER=analytics`  
 3. `pm2 start ecosystem.config.cjs` or restart `alfursan-bridge` + `alfursan-analytics`  
 4. Rollback: `pm2 stop alfursan-analytics` → set `REPORT_SCHEDULER_OWNER=bridge` → restart bridge  
+
+---
+
+## Mileage Mongo N+1 removal — COMPLETE (code + focused tests)
+
+- Batched incremental + daily mileage (`MILEAGE_CHUNK_SIZE` default 250)
+- Prior boundary points: one aggregation per chunk (`$or` + sort + `$group $first`)
+- DeviceStatus / DailyMileage: `bulkWrite` with `$inc` / `$set` only
+- Overspeed daily: OverspeedAlert authoritative (`MILEAGE_OVERSPEED_SOURCE=alerts`; `legacy_max` rollback)
+- Business day: Africa/Cairo (`MILEAGE_BUSINESS_DAY=cairo`; `utc` rollback). Static day key aligned.
+- Metrics: `analytics_mileage_*` on heartbeat / `/health`
+- Focused tests: `test/mileageBatch.test.js`
+- **Not in this phase:** Travel×7, Idle, Parking, gps/alarm dedupe, new indexes at startup
+
+### Query amplification (approx)
+
+| | Old (N devices) | New (chunk C=250) |
+|--|-----------------|-------------------|
+| Incremental | ~2 distinct + ~4N | ~2 distinct + ~4×⌈N/C⌉ |
+| Daily | ~1 distinct + ~5N | ~1 distinct + ~5×⌈N/C⌉ |
+
+### Indexes used (no new indexes created)
+
+- `gpspoints`: `{ imei: 1, packet_date: 1 }` / `{ imei: 1, packet_date: -1 }`
+- `overspeed_alerts`: `{ imei: 1, start_time: -1 }`
+- `acc_events`: `{ imei: 1, start_time: -1 }`
+- `devicestatuses`: unique `imei`
+- `dailymileages`: unique `{ imei: 1, day: 1 }`
+
+Optional prod verify (not run by agent):
+
+```js
+db.gpspoints.find({ imei: { $in: ["..."] }, packet_date: { $gt: ISODate("...") } }).explain("executionStats")
+```
+
+---
+
+## Travel ×7 Mongo redesign — COMPLETE (code + focused tests)
+
+- One IMEI `distinct` per Travel run (not per threshold)
+- Per chunk: one `GpsPoint.find({ imei:$in, packet_date range })` sorted `imei, packet_date`
+- Same in-memory points → `computeSegments` for each of `[1,3,5,10,15,30,60]` (7 CPU passes; **1 Mongo read**)
+- `TravelStat.bulkWrite` upsert on `(imei, day, stop_threshold_min)`
+- Business day: Africa/Cairo (`TRAVEL_BUSINESS_DAY=cairo`; `utc` rollback)
+- Chunk default **150** (`TRAVEL_CHUNK_SIZE`) — full-day tracks denser than mileage incremental
+- Metrics: `analytics_travel_*` on heartbeat / `/health`
+- Focused tests: `test/travelBatch.test.js`
+- Segment semantics unchanged (`computeSegments` HEAD-compatible)
+- **Not in this phase:** Idle, Parking, Trip replacement, gps/alarm dedupe
+
+### Query amplification (approx, T=7 thresholds)
+
+| | Old | New (C=150) |
+|--|-----|-------------|
+| Formula | T×(1 distinct + N finds + N upserts) | 1 distinct + ⌈N/C⌉ finds + ⌈N/C⌉ bulkWrites |
+| N=10k | ~7×(1+10k+10k) ≈ **140k** | 1 + 2×67 ≈ **135** |
+
+### Indexes used (no new indexes)
+
+- `gpspoints` `{ imei:1, packet_date:1 }`
+- `travelstats` unique `{ imei:1, day:1, stop_threshold_min:1 }`
+
+```js
+db.gpspoints.find({ imei: { $in: ["..."] }, packet_date: { $gte: ISODate("..."), $lt: ISODate("...") } }).sort({ imei:1, packet_date:1 }).explain("executionStats")
+```
+
+---
+
+## Idle Mongo N+1 removal — COMPLETE (code + focused tests)
+
+- One IMEI `distinct` per Idle run
+- Per chunk: one `GpsPoint.find({ imei:$in, packet_date range })` sorted `imei, packet_date`
+- Same `computeIdle` / `isAccOn` HEAD semantics (ignition=null → not idle)
+- `IdleStat.bulkWrite` with `updateOne` upsert **and** `deleteOne` when no qualifying idle
+- Business day: Africa/Cairo (`IDLE_BUSINESS_DAY=cairo`; `utc` rollback)
+- Chunk default **150** (`IDLE_CHUNK_SIZE`)
+- Metrics: `analytics_idle_*` including upserted/deleted counts
+- Live `handleIdleNotifySample` **unchanged**
+- Focused tests: `test/idleBatch.test.js`
+- **Follow-on COMPLETE:** Static batching + Trip restart (see below)
+
+### Query amplification (approx)
+
+| | Old | New (C=150) |
+|--|-----|-------------|
+| Formula | 1 distinct + N finds + N writes | 1 distinct + ⌈N/C⌉ finds + ⌈N/C⌉ bulkWrites |
+| N=10k | ~**20,001** | ~**135** |
+
+### Indexes used (no new indexes)
+
+- `gpspoints` `{ imei:1, packet_date:1 }`
+- `idlestats` unique `{ imei:1, day:1 }`
+
+---
+
+## Static Mongo batching — COMPLETE (code + focused tests)
+
+- Prefer one `DailyMileage.find({ day })`; GpsPoint fallback **only** for IMEIs missing DailyMileage
+- Fallback uses shared `sumMileageKm` (same calc as Mileage) in bounded chunks (`STATIC_FALLBACK_CHUNK_SIZE` default **100**)
+- `StaticStat.bulkWrite` in chunks (`STATIC_CHUNK_SIZE` default **500**)
+- Rule unchanged: `km <= 0.5` → `is_static`; fields/key unchanged for Laravel
+- Metrics: `analytics_static_*` including daily_mileage_hits / gps_fallback_devices
+- Startup Static-after-Mileage preserved
+- Focused tests: `test/staticBatch.test.js`
+
+### Query amplification (approx, DailyMileage complete)
+
+| | Old | New (C=500) |
+|--|-----|-------------|
+| Formula | ~1 + N upserts (+ N GpsPoint if fallback-heavy) | 1 DailyMileage + ⌈N/C⌉ bulkWrites (+ ⌈missing/100⌉ GpsPoint) |
+| N=10k | ~**10k–20k** | ~**21** (+ rare fallback) |
+
+---
+
+## Trip restart recovery — COMPLETE (code + focused tests)
+
+- Root cause: after restart `prevSpeed=null` / weak `lastNonZeroAt` → first moving packet could open/reopen Trip
+- Fix: `lib/tripRuntimeState.js` — once-per-IMEI recovery from open Trip + DeviceStatus; wired in bridge + persistence-worker
+- Tradeoff: if open Trip but no `last_speed`, assume `prevSpeed=0` (prevents duplicates; close/start only when gap ≥ BASE_GAP_MIN)
+- **No** per-packet Trip/DeviceStatus/GpsPoint recovery queries
+- Schema/fields unchanged; `TRIP_FLUSH_INTERVAL_MS` dirty flush preserved
+- Metrics: `trip_recovery_*`
+- Focused tests: `test/tripRecovery.test.js`
+
+---
+
+## Parking backfill operational safety — COMPLETE (manual script only)
+
+- `backfillParkingEvents.js`: chunked, serial per IMEI, file checkpoint resume, still **manual**
+- Never auto-run at analytics startup / PM2
+- ParkingEvent open/close (1/5) and document shape unchanged
+- Focused tests: `test/parkingBackfillSafety.test.js`
+
+---
+
+## Final analytics optimization summary (phase CLOSED)
+
+| Report | Old ~10k devices | New ~ |
+|--------|------------------|-------|
+| Mileage | ~40k–50k | ~160–200 |
+| Travel | ~140k | ~135 |
+| Idle | ~20k | ~135 |
+| Static | ~10k–20k | ~21 (+ rare fallback) |
+
+**Architecture is SCALE-READY BY DESIGN.** Controlled 10k load/soak validation remains a later explicit phase — do not claim production 10k-ready from formulas alone.
+
+### COMPLETE this phase
+
+- analytics process isolation (A1)
+- Mileage / Travel / Idle / Static optimization
+- Trip restart hardening
+- manual parking backfill safety
+- reporting contract + roadmap docs
+
+### DEFERRED (do not start next without explicit ask)
+
+- new reports; Laravel/frontend redesign; business-definition changes
+- Trip↔TravelStat / IdleStat↔live-idle unification
+- gps/alarm dedupe; historical migrations
+- **8 IMEI workers**; Raw Archive process isolation; full load/soak
 
 ---
 

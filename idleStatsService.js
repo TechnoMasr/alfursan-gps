@@ -1,68 +1,82 @@
-const { GpsPoint, IdleStat } = require("./mongo");
+/**
+ * IdleStat materialization — chunked GpsPoint reads + bulkWrite.
+ *
+ * computeIdle / isAccOn / handleIdleNotifySample semantics unchanged from HEAD.
+ * Live notify path (handleIdleNotifySample) is separate — do not conflate.
+ *
+ * Business day: Africa/Cairo (IDLE_BUSINESS_DAY=utc rollback).
+ */
+const { resolveMileageDay, startOfTodayUTC } = require("./lib/businessDay");
 
 const IDLE_SPEED_KPH = 5;
 const IDLE_MINUTES = 5;
 const IDLE_FUEL_LPH = 1;
 const SCHEDULE_MINUTES = 20;
+/** Full-day tracks — same conservative default as Travel. */
+const DEFAULT_CHUNK = 150;
+
+function mongoModels() {
+  return require("./mongo");
+}
 
 function pointDate(point) {
   return point?.packet_date || point?.date;
 }
 
-async function buildAndPersistIdleStats({
-  dayUtc,
-  idleSpeedKph = IDLE_SPEED_KPH,
-  idleMinutes = IDLE_MINUTES,
-  fuelLph = IDLE_FUEL_LPH,
-  requireAccOn = true,
-  maxGapSeconds = 10 * 60,
-}) {
-  const start = dayUtc ? new Date(dayUtc) : startOfTodayUTC();
-  const end = new Date(start);
-  end.setUTCDate(end.getUTCDate() + 1);
-
-  const imeis = await GpsPoint.distinct("imei", {
-    packet_date: { $gte: start, $lt: end },
-  });
-
-  const results = [];
-  for (const imei of imeis) {
-    const points = await GpsPoint.find({
-      imei,
-      packet_date: { $gte: start, $lt: end },
-    }).sort({ packet_date: 1 }).lean();
-
-    const stats = computeIdle(points, idleSpeedKph, idleMinutes, fuelLph, requireAccOn, maxGapSeconds);
-    const idleSeconds = Number(stats.idleSeconds) || 0;
-    const idleCount = Number(stats.idleCount) || 0;
-
-    if (idleSeconds <= 0 && idleCount <= 0) {
-      await IdleStat.deleteOne({ imei, day: start });
-      continue;
-    }
-
-    const doc = {
-      imei,
-      day: start,
-      idle_speed_kph: idleSpeedKph,
-      idle_minutes: idleMinutes,
-      require_acc_on: requireAccOn,
-      max_gap_seconds: maxGapSeconds,
-      idle_duration_seconds: idleSeconds,
-      idle_count: idleCount,
-      first_idle_start: stats.firstStart,
-      last_idle_end: stats.lastEnd,
-      fuel_waste_liters: stats.fuelWaste,
-    };
-
-    await IdleStat.findOneAndUpdate({ imei, day: start }, { $set: doc }, { upsert: true });
-    results.push(doc);
-  }
-
-  return results;
+function bump(metrics, key, by = 1) {
+  if (!metrics) return;
+  metrics[key] = (metrics[key] || 0) + by;
 }
 
-function computeIdle(points, idleSpeedKph, idleMinutes, fuelLph, requireAccOn = true, maxGapSeconds = 10 * 60) {
+function chunkArray(arr, size) {
+  const out = [];
+  const n = Math.max(1, Number(size) || DEFAULT_CHUNK);
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+
+function resolveIdleDay(options = {}) {
+  const mode =
+    options.businessDay ||
+    process.env.IDLE_BUSINESS_DAY ||
+    process.env.MILEAGE_BUSINESS_DAY ||
+    "cairo";
+  return resolveMileageDay({
+    dayUtc: options.dayUtc,
+    now: options.now,
+    businessDay: mode,
+  });
+}
+
+/**
+ * CURRENT HEAD: unknown/null ignition → false when requireAccOn.
+ * Do NOT infer ignition from speed.
+ */
+function isAccOn(p) {
+  if (p.ignition === true) return true;
+  if (p.ignition === false) return false;
+  if (p.acc_status === "on") return true;
+  if (p.acc_status === "off") return false;
+  if (p.accOn === true) return true;
+  if (p.accOn === false) return false;
+  if (p.statusDecoded && typeof p.statusDecoded.accOn === "boolean") {
+    return p.statusDecoded.accOn;
+  }
+  if (typeof p.acc === "boolean") return p.acc;
+  return false;
+}
+
+/**
+ * CURRENT HEAD idle interval algorithm — preserve exactly.
+ */
+function computeIdle(
+  points,
+  idleSpeedKph,
+  idleMinutes,
+  fuelLph,
+  requireAccOn = true,
+  maxGapSeconds = 10 * 60
+) {
   const minSeconds = idleMinutes * 60;
   let idleStart = null;
   let lastTs = null;
@@ -127,25 +141,170 @@ function computeIdle(points, idleSpeedKph, idleMinutes, fuelLph, requireAccOn = 
   return { idleSeconds, idleCount, firstStart, lastEnd, fuelWaste };
 }
 
-function isAccOn(p) {
-  if (p.ignition === true) return true;
-  if (p.ignition === false) return false;
-  if (p.acc_status === "on") return true;
-  if (p.acc_status === "off") return false;
-  if (p.accOn === true) return true;
-  if (p.accOn === false) return false;
-  if (p.statusDecoded && typeof p.statusDecoded.accOn === "boolean") return p.statusDecoded.accOn;
-  if (typeof p.acc === "boolean") return p.acc;
-  return false;
+function buildIdleDoc(
+  imei,
+  dayStart,
+  stats,
+  { idleSpeedKph, idleMinutes, requireAccOn, maxGapSeconds }
+) {
+  return {
+    imei,
+    day: dayStart,
+    idle_speed_kph: idleSpeedKph,
+    idle_minutes: idleMinutes,
+    require_acc_on: requireAccOn,
+    max_gap_seconds: maxGapSeconds,
+    idle_duration_seconds: Number(stats.idleSeconds) || 0,
+    idle_count: Number(stats.idleCount) || 0,
+    first_idle_start: stats.firstStart,
+    last_idle_end: stats.lastEnd,
+    fuel_waste_liters: stats.fuelWaste,
+  };
 }
 
-function startOfTodayUTC() {
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+/**
+ * Chunked IdleStat rebuild. One discovery, one GpsPoint read/chunk, bulkWrite.
+ */
+async function buildAndPersistIdleStats(options = {}) {
+  const models = options.GpsPoint && options.IdleStat ? null : mongoModels();
+  const GpsPoint = options.GpsPoint || models.GpsPoint;
+  const IdleStat = options.IdleStat || models.IdleStat;
+  const metrics = options.metrics || {};
+  const log = options.log || console;
+
+  const idleSpeedKph = options.idleSpeedKph ?? IDLE_SPEED_KPH;
+  const idleMinutes = options.idleMinutes ?? IDLE_MINUTES;
+  const fuelLph = options.fuelLph ?? IDLE_FUEL_LPH;
+  const requireAccOn = options.requireAccOn !== undefined ? options.requireAccOn : true;
+  const maxGapSeconds = options.maxGapSeconds ?? 10 * 60;
+  const chunkSize =
+    Number(options.chunkSize || process.env.IDLE_CHUNK_SIZE || DEFAULT_CHUNK) ||
+    DEFAULT_CHUNK;
+
+  const started = Date.now();
+  const { dayStart, dayEnd } = resolveIdleDay(options);
+
+  bump(metrics, "analytics_idle_mongo_reads", 1);
+  const imeis = options.imeis?.length
+    ? options.imeis
+    : await GpsPoint.distinct("imei", {
+        packet_date: { $gte: dayStart, $lt: dayEnd },
+      });
+
+  const results = [];
+  const failures = [];
+  let maxPointsPerDevice = 0;
+  let upserted = 0;
+  let deleted = 0;
+
+  for (const chunk of chunkArray(imeis, chunkSize)) {
+    bump(metrics, "analytics_idle_mongo_reads", 1);
+    const points = await GpsPoint.find({
+      imei: { $in: chunk },
+      packet_date: { $gte: dayStart, $lt: dayEnd },
+    })
+      .sort({ imei: 1, packet_date: 1 })
+      .lean();
+
+    bump(metrics, "analytics_idle_points_processed", points.length);
+
+    const byImei = new Map();
+    for (const p of points) {
+      const list = byImei.get(p.imei) || [];
+      list.push(p);
+      byImei.set(p.imei, list);
+    }
+
+    const ops = [];
+    const chunkDocs = [];
+
+    for (const imei of chunk) {
+      try {
+        const devicePoints = byImei.get(imei) || [];
+        if (devicePoints.length > maxPointsPerDevice) {
+          maxPointsPerDevice = devicePoints.length;
+        }
+
+        const stats = computeIdle(
+          devicePoints,
+          idleSpeedKph,
+          idleMinutes,
+          fuelLph,
+          requireAccOn,
+          maxGapSeconds
+        );
+        const idleSeconds = Number(stats.idleSeconds) || 0;
+        const idleCount = Number(stats.idleCount) || 0;
+
+        if (idleSeconds <= 0 && idleCount <= 0) {
+          ops.push({
+            deleteOne: { filter: { imei, day: dayStart } },
+          });
+          deleted += 1;
+          continue;
+        }
+
+        const doc = buildIdleDoc(imei, dayStart, stats, {
+          idleSpeedKph,
+          idleMinutes,
+          requireAccOn,
+          maxGapSeconds,
+        });
+        chunkDocs.push(doc);
+        ops.push({
+          updateOne: {
+            filter: { imei, day: dayStart },
+            update: { $set: doc },
+            upsert: true,
+          },
+        });
+        upserted += 1;
+      } catch (err) {
+        failures.push({ imei, error: String(err?.message || err) });
+        log.warn?.("[idle] device calculation failed", imei, err.message);
+      }
+    }
+
+    if (ops.length) {
+      bump(metrics, "analytics_idle_mongo_writes", 1);
+      bump(metrics, "analytics_idle_bulk_writes", 1);
+      await IdleStat.bulkWrite(ops, { ordered: false });
+      results.push(...chunkDocs);
+    }
+
+    bump(metrics, "analytics_idle_chunks_processed", 1);
+    bump(metrics, "analytics_idle_devices_processed", chunk.length);
+  }
+
+  metrics.analytics_idle_max_points_per_device = Math.max(
+    metrics.analytics_idle_max_points_per_device || 0,
+    maxPointsPerDevice
+  );
+  metrics.analytics_idle_records_upserted =
+    (metrics.analytics_idle_records_upserted || 0) + upserted;
+  metrics.analytics_idle_records_deleted =
+    (metrics.analytics_idle_records_deleted || 0) + deleted;
+  metrics.analytics_idle_duration_ms = Date.now() - started;
+  metrics.analytics_idle_last_success_at = new Date().toISOString();
+
+  if (failures.length) {
+    const err = new Error(
+      `idle partial failure: ${failures.length}/${imeis.length} devices failed`
+    );
+    err.failures = failures;
+    err.results = results;
+    throw err;
+  }
+
+  return results;
 }
 
 const idleNotifyStateByImei = new Map();
 
+/**
+ * Live idle notification — business path only. Unchanged from HEAD.
+ * Not used by scheduled IdleStat materialization.
+ */
 function handleIdleNotifySample(imei, sample, opts = {}) {
   if (!imei || !sample) return;
 
@@ -203,7 +362,13 @@ function startIdleStatsScheduler({
 
   async function runOnce() {
     try {
-      await buildAndPersistIdleStats({ idleSpeedKph, idleMinutes, fuelLph, requireAccOn, maxGapSeconds });
+      await buildAndPersistIdleStats({
+        idleSpeedKph,
+        idleMinutes,
+        fuelLph,
+        requireAccOn,
+        maxGapSeconds,
+      });
     } catch (err) {
       console.error("Idle stats job error:", err.message);
     }
@@ -214,5 +379,14 @@ module.exports = {
   startIdleStatsScheduler,
   buildAndPersistIdleStats,
   computeIdle,
+  isAccOn,
   handleIdleNotifySample,
+  buildIdleDoc,
+  chunkArray,
+  resolveIdleDay,
+  DEFAULT_CHUNK,
+  IDLE_SPEED_KPH,
+  IDLE_MINUTES,
+  startOfTodayUTC,
+  pointDate,
 };

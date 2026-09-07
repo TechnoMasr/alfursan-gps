@@ -9,9 +9,17 @@ const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const Trip = require("./trip");
-const { GpsPoint, GpsBuffer, CommandResponse, Notification, TraccarIngressRaw } = require("./mongo");
+const {
+  GpsPoint,
+  GpsBuffer,
+  CommandResponse,
+  Notification,
+  TraccarIngressRaw,
+  DeviceStatus,
+} = require("./mongo");
 const { normalizeTraccarPositionId } = require("./gpsPointStore");
 const { upsertDeviceStatus } = require("./deviceStatus");
+const { ensureTripRuntimeState } = require("./lib/tripRuntimeState");
 const { loadBridgeEnv } = require("./lib/bridgeEnv");
 const { readGpspointsWriterHeartbeat } = require("./lib/gpsPointWriter");
 const {
@@ -1011,6 +1019,51 @@ function startSubscribersServer() {
       analytics_last_success_travel: analyticsHb.analytics_last_success_travel || null,
       analytics_last_success_idle: analyticsHb.analytics_last_success_idle || null,
       analytics_last_success_static: analyticsHb.analytics_last_success_static || null,
+      analytics_mileage_devices_processed: analyticsHb.analytics_mileage_devices_processed || 0,
+      analytics_mileage_chunks_processed: analyticsHb.analytics_mileage_chunks_processed || 0,
+      analytics_mileage_points_processed: analyticsHb.analytics_mileage_points_processed || 0,
+      analytics_mileage_mongo_reads: analyticsHb.analytics_mileage_mongo_reads || 0,
+      analytics_mileage_mongo_writes: analyticsHb.analytics_mileage_mongo_writes || 0,
+      analytics_mileage_bulk_writes: analyticsHb.analytics_mileage_bulk_writes || 0,
+      analytics_mileage_duration_ms: analyticsHb.analytics_mileage_duration_ms || 0,
+      analytics_mileage_last_success_at: analyticsHb.analytics_mileage_last_success_at || null,
+      analytics_travel_devices_processed: analyticsHb.analytics_travel_devices_processed || 0,
+      analytics_travel_chunks_processed: analyticsHb.analytics_travel_chunks_processed || 0,
+      analytics_travel_points_processed: analyticsHb.analytics_travel_points_processed || 0,
+      analytics_travel_thresholds_processed: analyticsHb.analytics_travel_thresholds_processed || 0,
+      analytics_travel_mongo_reads: analyticsHb.analytics_travel_mongo_reads || 0,
+      analytics_travel_mongo_writes: analyticsHb.analytics_travel_mongo_writes || 0,
+      analytics_travel_bulk_writes: analyticsHb.analytics_travel_bulk_writes || 0,
+      analytics_travel_duration_ms: analyticsHb.analytics_travel_duration_ms || 0,
+      analytics_travel_max_points_per_device: analyticsHb.analytics_travel_max_points_per_device || 0,
+      analytics_travel_last_success_at: analyticsHb.analytics_travel_last_success_at || null,
+      analytics_idle_devices_processed: analyticsHb.analytics_idle_devices_processed || 0,
+      analytics_idle_chunks_processed: analyticsHb.analytics_idle_chunks_processed || 0,
+      analytics_idle_points_processed: analyticsHb.analytics_idle_points_processed || 0,
+      analytics_idle_mongo_reads: analyticsHb.analytics_idle_mongo_reads || 0,
+      analytics_idle_mongo_writes: analyticsHb.analytics_idle_mongo_writes || 0,
+      analytics_idle_bulk_writes: analyticsHb.analytics_idle_bulk_writes || 0,
+      analytics_idle_duration_ms: analyticsHb.analytics_idle_duration_ms || 0,
+      analytics_idle_max_points_per_device: analyticsHb.analytics_idle_max_points_per_device || 0,
+      analytics_idle_records_upserted: analyticsHb.analytics_idle_records_upserted || 0,
+      analytics_idle_records_deleted: analyticsHb.analytics_idle_records_deleted || 0,
+      analytics_idle_last_success_at: analyticsHb.analytics_idle_last_success_at || null,
+      analytics_static_devices_processed: analyticsHb.analytics_static_devices_processed || 0,
+      analytics_static_chunks_processed: analyticsHb.analytics_static_chunks_processed || 0,
+      analytics_static_daily_mileage_hits: analyticsHb.analytics_static_daily_mileage_hits || 0,
+      analytics_static_gps_fallback_devices: analyticsHb.analytics_static_gps_fallback_devices || 0,
+      analytics_static_points_processed: analyticsHb.analytics_static_points_processed || 0,
+      analytics_static_mongo_reads: analyticsHb.analytics_static_mongo_reads || 0,
+      analytics_static_mongo_writes: analyticsHb.analytics_static_mongo_writes || 0,
+      analytics_static_bulk_writes: analyticsHb.analytics_static_bulk_writes || 0,
+      analytics_static_duration_ms: analyticsHb.analytics_static_duration_ms || 0,
+      analytics_static_last_success_at: analyticsHb.analytics_static_last_success_at || null,
+      trip_recovery_loaded_total: bridgeMetrics.trip_recovery_loaded_total || 0,
+      trip_recovery_missing_total: bridgeMetrics.trip_recovery_missing_total || 0,
+      trip_recovery_open_restored_total: bridgeMetrics.trip_recovery_open_restored_total || 0,
+      trip_recovery_duplicate_prevented_total:
+        bridgeMetrics.trip_recovery_duplicate_prevented_total || 0,
+      trip_recovery_failures_total: bridgeMetrics.trip_recovery_failures_total || 0,
       startup_reconciliation_last_run_at: bridgeMetrics.startup_reconciliation_last_run_at || null,
       startup_reconciliation_traccar_devices: bridgeMetrics.startup_reconciliation_traccar_devices || 0,
       startup_reconciliation_mongo_online: bridgeMetrics.startup_reconciliation_mongo_online || 0,
@@ -1774,17 +1827,14 @@ async function resolveRuntimeDeviceIdByImei(imei) {
 }
 
 async function ensureState(imei) {
-  if (states.has(imei)) return states.get(imei);
-  const openTrip = await Trip.findOne({ imei, is_open: true }).sort({ start_at: -1 }).lean();
-  const st = {
-    prevSpeed: null,
-    lastNonZeroAt: null,
-    currentTripId: openTrip?._id || null,
-    currentDistKm: openTrip?.distance_km || 0,
-    prevPacketAt: null,
-  };
-  states.set(imei, st);
-  return st;
+  return ensureTripRuntimeState({
+    imei,
+    stateMap: states,
+    Trip,
+    DeviceStatus,
+    metrics: bridgeMetrics,
+    log: console,
+  });
 }
 
 function minutesDiff(a, b) {
