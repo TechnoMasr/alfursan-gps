@@ -2915,7 +2915,7 @@ async function persistPositionHeavy(ctx) {
     voltageUnit: attrs?.power != null ? "v" : undefined,
     direction,
 
-    voltage: attrs?.power ?? attrs?.battery ?? attrs?.batteryLevel,
+    voltage: attrs?.power ?? null,
     batteryLevel: attrs?.batteryLevel ?? attrs?.battery ,
     ignition: attrs.ignition ?? null,
     motion: attrs.motion ?? null,
@@ -2925,10 +2925,8 @@ async function persistPositionHeavy(ctx) {
     alarm: attrs.alarm ?? null,
     deviceStatus: doc?.deviceStatus,
 
-
-
-
   });
+  
 
   const totalDistanceM = Number(attrs?.totalDistance);
   const statusSet = {
