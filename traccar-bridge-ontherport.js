@@ -52,7 +52,7 @@ const { createEventLoopLagMonitor } = require("./lib/eventLoopLag");
 const { createImeiDebugger } = require("./lib/imeiDebug");
 const { countSubscriberMetrics } = require("./lib/subscriberCounts");
 const { createTenantRoomGpsThrottle } = require("./lib/tenantRoomGpsThrottle");
-const { createStartupConnectivityReconciler } = require("./lib/startupConnectivityReconciliation");
+const { createStartupConnectivityReconciler, syncExplicitTraccarOfflineFromSnapshot } = require("./lib/startupConnectivityReconciliation");
 const { createTraccarModelSync } = require("./lib/traccarModelSync");
 const {
   verifyForwardBearer,
@@ -3089,6 +3089,15 @@ async function bootBridge() {
           forwardedDevice: change.device,
         });
       }
+      // Correct stale Mongo ONLINE when Traccar explicitly reports offline.
+      // Online remains packet/forward-driven — never force online from Traccar status=online.
+      void syncExplicitTraccarOfflineFromSnapshot({
+        devices,
+        metrics: bridgeMetrics,
+        log: console,
+      }).catch((err) => {
+        console.warn("[traccar-registry-offline-sync] failed", err?.message || err);
+      });
     },
   });
   traccarDeviceRegistry.startPolling();
