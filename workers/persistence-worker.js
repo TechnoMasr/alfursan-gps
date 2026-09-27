@@ -11,7 +11,7 @@ const { handleOverspeedSample } = require("../overspeedService");
 const { handleAccSample, powerEventToAccOn } = require("../accReportService");
 const { persistTenantNotification } = require("../notificationStore");
 const { handleIdleNotifySample } = require("../idleStatsService");
-const { sendPushNotification } = require("../fcm.service");
+const { sendPushNotification, buildFcmUserIdQuery } = require("../fcm.service");
 const Trip = require("../trip");
 const mongoose = require("mongoose");
 const { GpsPoint, DeviceStatus } = require("../mongo");
@@ -431,13 +431,23 @@ async function SEND_NOTIFY_TO_CLIENT(imei, title, body, data = {}) {
 
     if (deviceOwnerId) {
       const fcmTokensColl = mongoose.connection.collection("fcm_tokens");
-      const fcmDocs = await fcmTokensColl.find({ user_id: deviceOwnerId }).project({ fcm_token: 1 }).toArray();
+      const userIdQuery = buildFcmUserIdQuery(deviceOwnerId);
+      const fcmDocs = userIdQuery
+        ? await fcmTokensColl.find(userIdQuery).project({ fcm_token: 1 }).toArray()
+        : [];
       for (const tokenDoc of fcmDocs) {
         if (!tokenDoc?.fcm_token) continue;
         try {
-          await sendPushNotification({ token: tokenDoc.fcm_token, title: customTitle, body: body || customTitle, data });
+          await sendPushNotification({
+            token: tokenDoc.fcm_token,
+            title: customTitle,
+            body: body || customTitle,
+            data,
+            imei,
+            user_id: deviceOwnerId,
+          });
         } catch {
-          /* ignore push failures */
+          /* ignore push failures — never interrupt GPS/notification persistence */
         }
       }
     }

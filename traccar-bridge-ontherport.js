@@ -68,7 +68,7 @@ const { evaluateGeofences } = require("./geofenceService");
 const { handleParkingSample } = require("./parkingEventsService");
 const { handleOverspeedSample } = require("./overspeedService");
 const { handleAccSample, powerEventToAccOn } = require("./accReportService");
-const { sendPushNotification } = require("./fcm.service");
+const { sendPushNotification, buildFcmUserIdQuery } = require("./fcm.service");
 const { persistTenantNotification } = require("./notificationStore");
 const { parseCommandResponseLegacyFields } = require("./commandResponseParse");
 const { handleIdleNotifySample } = require("./idleStatsService");
@@ -2023,10 +2023,13 @@ async function SEND_NOTIFY_TO_CLIENT(imei, title, body, data = {}) {
 
     if (deviceOwnerId) {
       const fcmTokensColl = mongoose.connection.collection("fcm_tokens");
-      const fcmDocs = await fcmTokensColl
-        .find({ user_id: deviceOwnerId })
-        .project({ fcm_token: 1, user_id: 1 })
-        .toArray();
+      const userIdQuery = buildFcmUserIdQuery(deviceOwnerId);
+      const fcmDocs = userIdQuery
+        ? await fcmTokensColl
+            .find(userIdQuery)
+            .project({ fcm_token: 1, user_id: 1 })
+            .toArray()
+        : [];
       tokensCount = fcmDocs.length;
 
       for (const tokenDoc of fcmDocs) {
@@ -2038,6 +2041,8 @@ async function SEND_NOTIFY_TO_CLIENT(imei, title, body, data = {}) {
             title: customTitle,
             body: safeBody,
             data,
+            imei,
+            user_id: deviceOwnerId,
           });
           successCount++;
         } catch (err) {
