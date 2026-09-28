@@ -743,14 +743,41 @@ describe("startup connectivity reconciliation", () => {
     assert.equal(marked.length, 0);
   });
 
-  it("Traccar present with null/unknown status does not mark offline", async () => {
+  it("Traccar present with status=unknown + Mongo online is marked offline", async () => {
+    const marked = [];
+    const reasons = [];
+    const registry = createTraccarDeviceRegistry({
+      getClient: () =>
+        fakeClient(() => ({
+          data: [{ id: 2, uniqueId: "UNK1", status: "unknown" }],
+        })),
+    });
+    const result = await runStartupConnectivityReconciliation({
+      registry,
+      metrics: {},
+      log: quietLog,
+      waitForMongoReadyFn: async () => {},
+      markOfflineFn: async ({ imei, reason }) => {
+        marked.push(imei);
+        reasons.push(reason);
+        return { transitioned: true };
+      },
+      getMongoOnline: async () => [{ imei: "UNK1", status: "online" }],
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.markedOffline, 1);
+    assert.equal(result.traccarOfflineDevices, 1);
+    assert.deepEqual(marked, ["UNK1"]);
+    assert.equal(reasons[0], "startup_reconciliation_traccar_offline");
+  });
+
+  it("Traccar present with null/empty status does not mark offline", async () => {
     const marked = [];
     const registry = createTraccarDeviceRegistry({
       getClient: () =>
         fakeClient(() => ({
           data: [
             { id: 1, uniqueId: "NULLST", status: null },
-            { id: 2, uniqueId: "UNKST", status: "unknown" },
             { id: 3, uniqueId: "EMPTYST", status: "  " },
           ],
         })),
@@ -766,7 +793,6 @@ describe("startup connectivity reconciliation", () => {
       },
       getMongoOnline: async () => [
         { imei: "NULLST", status: "online" },
-        { imei: "UNKST", status: "online" },
         { imei: "EMPTYST", status: "online" },
       ],
     });
@@ -776,24 +802,28 @@ describe("startup connectivity reconciliation", () => {
     assert.equal(marked.length, 0);
   });
 
-  it("buildTraccarPresenceSets only flags explicit offline", () => {
+  it("buildTraccarPresenceSets flags offline and unknown only", () => {
     const { traccarImeis, traccarOfflineImeis } = buildTraccarPresenceSets([
       { uniqueId: "A", status: "offline" },
       { uniqueId: "B", status: "ONLINE" },
       { uniqueId: "C", status: null },
       { uniqueId: "D" },
       { uniqueId: "E", status: " Offline " },
+      { uniqueId: "F", status: "unknown" },
+      { uniqueId: "G", status: " UNKNOWN " },
+      { uniqueId: "H", status: "weird" },
     ]);
-    assert.equal(traccarImeis.size, 5);
-    assert.deepEqual([...traccarOfflineImeis].sort(), ["A", "E"]);
+    assert.equal(traccarImeis.size, 8);
+    assert.deepEqual([...traccarOfflineImeis].sort(), ["A", "E", "F", "G"]);
   });
 
-  it("registry onSnapshot explicit-offline sync uses markOffline helper", async () => {
+  it("registry onSnapshot offline/unknown sync uses markOffline helper", async () => {
     const marked = [];
     const devices = [
       { id: 1, uniqueId: "KEEP_ON", status: "online" },
       { id: 2, uniqueId: "NOW_OFF", status: "offline" },
       { id: 3, uniqueId: "NO_STATUS", status: null },
+      { id: 4, uniqueId: "NOW_UNK", status: "unknown" },
     ];
     const metrics = {};
     const result = await syncExplicitTraccarOfflineFromSnapshot({
@@ -805,13 +835,16 @@ describe("startup connectivity reconciliation", () => {
         return { transitioned: true };
       },
     });
-    assert.equal(result.offlineCandidates, 1);
-    assert.equal(result.markedOffline, 1);
-    assert.equal(marked.length, 1);
-    assert.equal(marked[0].imei, "NOW_OFF");
-    assert.equal(marked[0].reason, "traccar_registry_status_offline");
-    assert.equal(marked[0].source, "traccar_registry_refresh");
-    assert.ok(metrics.traccar_registry_explicit_offline_marked_total >= 1);
+    assert.equal(result.offlineCandidates, 2);
+    assert.equal(result.markedOffline, 2);
+    assert.equal(marked.length, 2);
+    assert.deepEqual(
+      marked.map((m) => m.imei).sort(),
+      ["NOW_OFF", "NOW_UNK"]
+    );
+    assert.ok(marked.every((m) => m.reason === "traccar_registry_status_offline"));
+    assert.ok(marked.every((m) => m.source === "traccar_registry_refresh"));
+    assert.ok(metrics.traccar_registry_explicit_offline_marked_total >= 2);
 
     // Already-offline Mongo (transitioned:false) does not inflate marked count
     const result2 = await syncExplicitTraccarOfflineFromSnapshot({
@@ -820,7 +853,7 @@ describe("startup connectivity reconciliation", () => {
       log: quietLog,
       markOfflineFn: async () => ({ transitioned: false }),
     });
-    assert.equal(result2.offlineCandidates, 1);
+    assert.equal(result2.offlineCandidates, 2);
     assert.equal(result2.markedOffline, 0);
   });
 });
