@@ -9,11 +9,47 @@ const {
   markDeviceOnline,
 } = require("./deviceConnectivityService");
 
-function newerFixCondition(fixAt) {
+/** Max allowed fixTime ahead of server/ingress reference before treating as poisoned/future. */
+const MAX_FUTURE_FIX_MS = 10 * 60 * 1000;
+
+function maxFutureFixAt(referenceAt) {
+  const ref =
+    referenceAt instanceof Date && !Number.isNaN(referenceAt.getTime())
+      ? referenceAt
+      : new Date();
+  return new Date(ref.getTime() + MAX_FUTURE_FIX_MS);
+}
+
+/**
+ * Pure semantics (shared with Mongo pipeline expression).
+ * 15m tolerance is vs server/reference time only — NOT vs stored last_fix_at.
+ */
+function isNewerFix(fixAt, lastFixAt, referenceAt) {
+  if (!(fixAt instanceof Date) || Number.isNaN(fixAt.getTime())) return false;
+  const maxFuture = maxFutureFixAt(referenceAt);
+  if (fixAt.getTime() > maxFuture.getTime()) return false;
+
+  if (lastFixAt == null) return true;
+  const stored = lastFixAt instanceof Date ? lastFixAt : new Date(lastFixAt);
+  if (Number.isNaN(stored.getTime())) return true;
+
+  if (fixAt.getTime() > stored.getTime()) return true;
+  if (stored.getTime() > maxFuture.getTime()) return true; // poisoned stored
+  return false;
+}
+
+function newerFixCondition(fixAt, referenceAt) {
+  const maxFutureAt = maxFutureFixAt(referenceAt);
   return {
-    $or: [
-      { $eq: [{ $ifNull: ["$last_fix_at", null] }, null] },
-      { $gt: [fixAt, "$last_fix_at"] },
+    $and: [
+      { $lte: [fixAt, maxFutureAt] },
+      {
+        $or: [
+          { $eq: [{ $ifNull: ["$last_fix_at", null] }, null] },
+          { $gt: [fixAt, "$last_fix_at"] },
+          { $gt: ["$last_fix_at", maxFutureAt] },
+        ],
+      },
     ],
   };
 }
@@ -37,7 +73,8 @@ function buildGpsStatusUpdatePipeline({
   hasCoords,
 }) {
   const now = new Date();
-  const newer = fixValid ? newerFixCondition(fixAt) : { $literal: false };
+  const referenceAt = ingressValid ? ingressAt : now;
+  const newer = fixValid ? newerFixCondition(fixAt, referenceAt) : { $literal: false };
   const skipPositionAt = attrsTypeNum === 19  || !speed || speed <=1;
 
   const $set = {
@@ -56,8 +93,9 @@ function buildGpsStatusUpdatePipeline({
   }
 
   if (fixValid) {
+    // Else keeps existing last_fix_at (do not seed from a rejected future candidate).
     $set.last_fix_at = {
-      $cond: [newer, fixAt, { $ifNull: ["$last_fix_at", fixAt] }],
+      $cond: [newer, fixAt, { $ifNull: ["$last_fix_at", null] }],
     };
   }
 
@@ -287,4 +325,6 @@ module.exports = {
   upsertDeviceStatus,
   buildGpsStatusUpdatePipeline,
   newerFixCondition,
+  isNewerFix,
+  MAX_FUTURE_FIX_MS,
 };
